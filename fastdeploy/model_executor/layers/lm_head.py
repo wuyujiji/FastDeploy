@@ -23,6 +23,7 @@ from paddle.distributed import fleet
 
 from fastdeploy.config import FDConfig
 from fastdeploy.model_executor.models.utils import set_weight_attrs
+from torch.cuda import nvtx
 
 from .utils import get_tensor
 
@@ -149,9 +150,12 @@ class ParallelLMHead(nn.Layer):
         logits = input
         if self.use_ep:
             if self.linear_bias_key is None:
-                logits = paddle.matmul(logits, self.weight)
+                with nvtx.range("use_ep_matmul"):
+                    logits = paddle.matmul(logits, self.weight)
             else:
-                logits = paddle.incubate.nn.functional.fused_linear(logits, self.weight, self.bias)
+                with nvtx.range("use_ep_fused_linear"):
+                    logits = paddle.incubate.nn.functional.fused_linear(logits, self.weight, self.bias)
         else:
-            logits = self.linear(logits)
+            with nvtx.range("no_use_ep_linear"):
+                logits = self.linear(logits)
         return logits

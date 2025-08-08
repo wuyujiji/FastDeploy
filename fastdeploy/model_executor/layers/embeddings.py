@@ -20,6 +20,7 @@ import numpy as np
 import paddle
 from paddle import nn
 from paddle.distributed import fleet
+from torch.cuda import nvtx
 
 from fastdeploy.config import FDConfig
 from fastdeploy.model_executor.models.utils import set_weight_attrs
@@ -126,19 +127,24 @@ class VocabParallelEmbedding(nn.Layer):
             Tensor: Embedded tensor representation of the input IDs.
         """
         if self.use_ep:
-            input_embedings = self.embeddings(ids_remove_padding)
+            with nvtx.range("use_ep_word_embeddings"):
+                input_embedings = self.embeddings(ids_remove_padding)
         else:
             if self.column_cut:
-                input_embedings = self.embeddings(ids_remove_padding)
+                with nvtx.range("column_cut_embedding"):
+                    input_embedings = self.embeddings(ids_remove_padding)
                 inputs_embeds_temp = []
-                paddle.distributed.all_gather(
-                    inputs_embeds_temp,
-                    input_embedings,
-                    group=fleet.get_hybrid_communicate_group().get_model_parallel_group(),
-                    sync_op=True,
-                )
-                input_embedings = paddle.concat(inputs_embeds_temp, -1)
+                with nvtx.range("all_gather"):
+                    paddle.distributed.all_gather(
+                        inputs_embeds_temp,
+                        input_embedings,
+                        group=fleet.get_hybrid_communicate_group().get_model_parallel_group(),
+                        sync_op=True,
+                    )
+                with nvtx.range("concat"):
+                    input_embedings = paddle.concat(inputs_embeds_temp, -1)
             else:
-                input_embedings = self.embeddings(ids_remove_padding)
+                with nvtx.range("non_column_cut_embedding"):
+                    input_embedings = self.embeddings(ids_remove_padding)
 
         return input_embedings

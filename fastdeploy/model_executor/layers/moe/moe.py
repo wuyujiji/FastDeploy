@@ -19,6 +19,7 @@ from typing import Optional
 import paddle
 from paddle import nn
 from paddleformers.utils.log import logger
+from torch.cuda import nvtx
 
 from fastdeploy import envs
 from fastdeploy.model_executor.layers.utils import get_tensor
@@ -504,5 +505,6 @@ class FusedMoE(nn.Layer):
             Tensor: Output tensor.s
 
         """
-        out = self.quant_method.apply(self, x, gate)
+        with nvtx.range("fused_moe_forward"):
+            out = self.quant_method.apply(self, x, gate)
         return out

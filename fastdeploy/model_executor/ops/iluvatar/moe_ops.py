@@ -19,6 +19,7 @@ from typing import Optional
 import paddle
 from paddle.incubate.nn.functional import swiglu
 from paddle.nn.quant import weight_only_linear
+from torch.cuda import nvtx
 
 try:
     from fastdeploy.model_executor.ops.iluvatar import w8a16_group_gemm
@@ -96,8 +97,12 @@ def iluvatar_moe_expert_ffn(
     assert expert_idx_per_token is None
     assert quant_method in ("weight_only_int8")
     assert not used_in_ep_low_latency
-    tokens_expert_prefix_sum_cpu = tokens_expert_prefix_sum.to("cpu")
-    ffn1_output = w8a16_group_gemm(permute_input, ffn1_weight, ffn1_scale, tokens_expert_prefix_sum_cpu, -1)
-    act_out = swiglu(ffn1_output)
-    output = w8a16_group_gemm(act_out, ffn2_weight, ffn2_scale, tokens_expert_prefix_sum_cpu, -1)
+    with nvtx.range("tokens_expert_prefix_d2h"):
+        tokens_expert_prefix_sum_cpu = tokens_expert_prefix_sum.to("cpu")
+    with nvtx.range("ffn1_w8a16_group_gemm"):
+        ffn1_output = w8a16_group_gemm(permute_input, ffn1_weight, ffn1_scale, tokens_expert_prefix_sum_cpu, -1)
+    with nvtx.range("swiglu"):
+        act_out = swiglu(ffn1_output)
+    with nvtx.range("ffn2_w8a16_group_gemm"):
+        output = w8a16_group_gemm(act_out, ffn2_weight, ffn2_scale, tokens_expert_prefix_sum_cpu, -1)
     return output

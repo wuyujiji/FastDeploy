@@ -71,6 +71,7 @@ from fastdeploy.model_executor.forward_meta import ForwardMeta
 from fastdeploy.model_executor.models.ernie4_5_vl.modeling_resampler import ScatterOp
 from fastdeploy.worker.model_runner_base import ModelRunnerBase
 from fastdeploy.worker.output import ModelOutputData, ModelRunnerOutput
+from torch.cuda import nvtx
 
 
 class GPUModelRunner(ModelRunnerBase):
@@ -782,22 +783,23 @@ class GPUModelRunner(ModelRunnerBase):
             )
 
         # Remove padding
-        (
-            ids_remove_padding,
-            cum_offsets,
-            batch_id_per_token,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            output_cum_offsets,
-            output_padding_offset,
-        ) = pre_process(
-            self.share_inputs["input_ids"],
-            self.share_inputs["seq_lens_this_time"],
-            self.speculative_decoding,
-            (self.share_inputs["draft_tokens"] if self.speculative_decoding else None),
-            self.share_inputs["seq_lens_encoder"],
-            self.share_inputs["seq_lens_decoder"],
-        )
+        with nvtx.range("pre_process"):
+            (
+                ids_remove_padding,
+                cum_offsets,
+                batch_id_per_token,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                output_cum_offsets,
+                output_padding_offset,
+            ) = pre_process(
+                self.share_inputs["input_ids"],
+                self.share_inputs["seq_lens_this_time"],
+                self.speculative_decoding,
+                (self.share_inputs["draft_tokens"] if self.speculative_decoding else None),
+                self.share_inputs["seq_lens_encoder"],
+                self.share_inputs["seq_lens_decoder"],
+            )
 
         self.share_inputs["ids_remove_padding"].copy_(ids_remove_padding, False)
         self.share_inputs["cum_offsets"].copy_(cum_offsets, False)
@@ -814,7 +816,8 @@ class GPUModelRunner(ModelRunnerBase):
         max_bad_tokens_len = paddle.max(self.share_inputs["bad_tokens_len"])
 
         # Initialize forward meta data
-        self.initialize_forward_meta()
+        with nvtx.range("initialize_forward_meta"):
+            self.initialize_forward_meta()
 
         # Get sampling metadata
         self.sampling_metadata = SamplingMetadata(
@@ -1287,8 +1290,10 @@ class GPUModelRunner(ModelRunnerBase):
         """
         # 1. Prepare inputs of model and sampler.
         skip_idx_list = self._get_skip_idx(model_forward_batch)
-        self._prepare_inputs()
-        self.sampler.pre_process(skip_idx_list)
+        with nvtx.range("prepare_inputs"):
+            self._prepare_inputs()
+        with nvtx.range("pre_process"):
+            self.sampler.pre_process(skip_idx_list)
 
         # NOTE(wufeisheng): If `not_need_stop`` is False, it means the current worker is in an idle state.
         # This logic is not used in TP (Tensor Parallelism) mode. However, in EP (Expert Parallelism) mode,
@@ -1301,48 +1306,56 @@ class GPUModelRunner(ModelRunnerBase):
         self.padding_cudagraph_inputs()
 
         # 3. Execute model
-        if self.enable_mm:
-            model_output = self.model(
-                self.share_inputs["ids_remove_padding"],
-                self.share_inputs["image_features"],
-                self.forward_meta,
-            )
-            hidden_states = model_output
-        else:
-            model_output = self.model(
-                ids_remove_padding=self.share_inputs["ids_remove_padding"],
-                forward_meta=self.forward_meta,
-            )
-            hidden_states = rebuild_padding(
-                model_output,
-                self.share_inputs["cum_offsets"],
-                self.share_inputs["seq_lens_this_time"],
-                self.share_inputs["seq_lens_decoder"],
-                self.share_inputs["seq_lens_encoder"],
-                (self.share_inputs["output_padding_offset"] if self.speculative_decoding else None),
-                self.parallel_config.max_model_len,
-            )
+        with nvtx.range("compute_model_output"):
+            if self.enable_mm:
+                with nvtx.range("enable_mm"):
+                    model_output = self.model(
+                        self.share_inputs["ids_remove_padding"],
+                        self.share_inputs["image_features"],
+                        self.forward_meta,
+                    )
+                    hidden_states = model_output
+            else:
+                with nvtx.range("no_enable_mm"):
+                    model_output = self.model(
+                        ids_remove_padding=self.share_inputs["ids_remove_padding"],
+                        forward_meta=self.forward_meta,
+                    )
+            with nvtx.range("rebuild_padding"):
+                hidden_states = rebuild_padding(
+                    model_output,
+                    self.share_inputs["cum_offsets"],
+                    self.share_inputs["seq_lens_this_time"],
+                    self.share_inputs["seq_lens_decoder"],
+                    self.share_inputs["seq_lens_encoder"],
+                    (self.share_inputs["output_padding_offset"] if self.speculative_decoding else None),
+                    self.parallel_config.max_model_len,
+                )
 
         # 4. Compute logits, Sample
-        logits = self.model.compute_logits(hidden_states)
+        with nvtx.range("compute logits"):
+            logits = self.model.compute_logits(hidden_states)
 
         if not self.speculative_decoding:
-            set_value_by_flags_and_idx(
-                self.share_inputs["pre_ids"],
-                self.share_inputs["input_ids"],
-                self.share_inputs["seq_lens_this_time"],
-                self.share_inputs["seq_lens_encoder"],
-                self.share_inputs["seq_lens_decoder"],
-                self.share_inputs["step_idx"],
-                self.share_inputs["stop_flags"],
-            )
-            sampler_output = self.sampler(
-                logits,
-                self.sampling_metadata,
-                skip_idx_list,
-            )
+            with nvtx.range("set_value_by_flags_and_idx"):
+                set_value_by_flags_and_idx(
+                    self.share_inputs["pre_ids"],
+                    self.share_inputs["input_ids"],
+                    self.share_inputs["seq_lens_this_time"],
+                    self.share_inputs["seq_lens_encoder"],
+                    self.share_inputs["seq_lens_decoder"],
+                    self.share_inputs["step_idx"],
+                    self.share_inputs["stop_flags"],
+                )
+            with nvtx.range("samper_forward"):
+                sampler_output = self.sampler(
+                    logits,
+                    self.sampling_metadata,
+                    skip_idx_list,
+                )
             if self.parallel_config.tensor_parallel_size > 1:
-                paddle.distributed.broadcast(sampler_output.sampled_token_ids, 0)
+                with nvtx.range("broadcast_sampled_token_ids"):
+                    paddle.distributed.broadcast(sampler_output.sampled_token_ids, 0)
 
         else:
             self.sampler(
@@ -1395,15 +1408,16 @@ class GPUModelRunner(ModelRunnerBase):
             skip_save_output = True
         else:
             skip_save_output = False
-        post_process(
-            sampler_output=sampler_output,
-            model_output=model_output_data,
-            share_inputs=self.share_inputs,
-            block_size=self.cache_config.block_size,
-            save_each_rank=self.parallel_config.use_ep,
-            speculative_decoding=self.speculative_decoding,
-            skip_save_output=skip_save_output,
-        )
+        with nvtx.range("post_process"):
+            post_process(
+                sampler_output=sampler_output,
+                model_output=model_output_data,
+                share_inputs=self.share_inputs,
+                block_size=self.cache_config.block_size,
+                save_each_rank=self.parallel_config.use_ep,
+                speculative_decoding=self.speculative_decoding,
+                skip_save_output=skip_save_output,
+            )
 
         # 6. Speculative decode
         if self.speculative_decoding:
@@ -1416,16 +1430,19 @@ class GPUModelRunner(ModelRunnerBase):
         self.share_inputs["infer_seed"].add_(self.infer_seed_increment)
         self.share_inputs["infer_seed"][:] %= self.MAX_INFER_SEED
         if not envs.ENABLE_V1_KVCACHE_SCHEDULER:
-            step_cuda(
-                self.share_inputs,
-                self.cache_config.block_size,
-                self.cache_config.enc_dec_block_num,
-                self.speculative_config,
-                self.cache_config.enable_prefix_caching,
-            )
+            with nvtx.range("step_cuda"):
+                step_cuda(
+                    self.share_inputs,
+                    self.cache_config.block_size,
+                    self.cache_config.enc_dec_block_num,
+                    self.speculative_config,
+                    self.cache_config.enable_prefix_caching,
+                )
 
-            self._update_chunked_prefill(model_forward_batch)
-            self._add_cache(model_forward_batch)
+            with nvtx.range("_update_chunked_prefill"):
+                self._update_chunked_prefill(model_forward_batch)
+            with nvtx.range("_add_cache"):
+                self._add_cache(model_forward_batch)
 
         self.seq_lens_this_time_buffer[:num_running_requests].copy_(
             self.share_inputs["seq_lens_this_time"][:num_running_requests], False

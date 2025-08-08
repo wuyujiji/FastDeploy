@@ -20,6 +20,7 @@ from paddle.nn.quant import weight_quantize
 from paddleformers.utils.log import logger
 
 import fastdeploy
+from torch.cuda import nvtx
 from fastdeploy.distributed.communication import tensor_model_parallel_all_reduce
 from fastdeploy.platforms import current_platform
 
@@ -266,24 +267,25 @@ class CutlassMoEMethod(UnquantizedFusedMoEMethod):
                 topk_only_mode=True,
             )
         else:
-            (
-                permute_input,
-                token_nums_per_expert,
-                permute_indices_per_token,
-                topk_weights,
-                topk_idx,
-                expert_idx_per_token,
-            ) = moe_expert_dispatch(
-                x,
-                gate_out,
-                layer.gate_correction_bias,
+            with nvtx.range("moe_expert_dispatch"):
                 (
-                    layer.up_gate_proj_in_scale if hasattr(layer, "up_gate_proj_in_scale") else None
-                ),  # if set, permute_input will be int8_t
-                layer.top_k,
-                False,
-                topk_only_mode=False,
-            )
+                    permute_input,
+                    token_nums_per_expert,
+                    permute_indices_per_token,
+                    topk_weights,
+                    topk_idx,
+                    expert_idx_per_token,
+                ) = moe_expert_dispatch(
+                    x,
+                    gate_out,
+                    layer.gate_correction_bias,
+                    (
+                        layer.up_gate_proj_in_scale if hasattr(layer, "up_gate_proj_in_scale") else None
+                    ),  # if set, permute_input will be int8_t
+                    layer.top_k,
+                    False,
+                    topk_only_mode=False,
+                )
 
         if self.moe_quant_type != "w4a8":
             # only w4a8 need expert_idx_per_token
@@ -292,21 +294,24 @@ class CutlassMoEMethod(UnquantizedFusedMoEMethod):
         else:
             expert_idx_per_token = expert_idx_per_token.cast("int64")
 
-        ffn_out = self.compute_ffn(layer, permute_input, token_nums_per_expert, expert_idx_per_token)
+        with nvtx.range("compute_ffn"):
+            ffn_out = self.compute_ffn(layer, permute_input, token_nums_per_expert, expert_idx_per_token)
 
         # reduce 中会做 topk 个 weight 的 norm 和 routed_scaling_factor
-        fused_moe_out = moe_expert_reduce(
-            ffn_out,
-            topk_weights,
-            permute_indices_per_token,
-            topk_idx,
-            None,
-            norm_topk_prob=False if layer.topk_method == "noaux_tc" else True,
-            routed_scaling_factor=1.0,
-        )
+        with nvtx.range("moe_expert_reduce"):
+            fused_moe_out = moe_expert_reduce(
+                ffn_out,
+                topk_weights,
+                permute_indices_per_token,
+                topk_idx,
+                None,
+                norm_topk_prob=False if layer.topk_method == "noaux_tc" else True,
+                routed_scaling_factor=1.0,
+            )
 
         if layer.reduce_results and layer.tp_size > 1:
-            tensor_model_parallel_all_reduce(fused_moe_out)
+            with nvtx.range("tensor_model_parallel_all_reduce"):
+                tensor_model_parallel_all_reduce(fused_moe_out)
 
         return fused_moe_out
 

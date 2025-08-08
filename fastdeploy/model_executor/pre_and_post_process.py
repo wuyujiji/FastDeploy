@@ -68,6 +68,7 @@ else:
     )
 
 from fastdeploy.worker.output import ModelOutputData, ModelRunnerOutput, SamplerOutput
+from torch.cuda import nvtx
 
 DISABLE_RECOVER = envs.FD_DISABLED_RECOVER == "1"
 
@@ -132,13 +133,14 @@ def pre_process(
             max_len,
         )
     else:
-        (
-            ids_remove_padding,
-            cum_offsets,
-            batch_id_per_token,
-            cu_seqlens_q,
-            cu_seqlens_k,
-        ) = get_padding_offset(input_ids, cum_offsets_now, token_num, seq_lens_this_time)
+        with nvtx.range("get_padding_offset"):
+            (
+                ids_remove_padding,
+                cum_offsets,
+                batch_id_per_token,
+                cu_seqlens_q,
+                cu_seqlens_k,
+            ) = get_padding_offset(input_ids, cum_offsets_now, token_num, seq_lens_this_time)
     return (
         ids_remove_padding,
         cum_offsets,
@@ -161,69 +163,72 @@ def post_process_normal(
     """Post-processing steps after completing a single token generation."""
     # handle vl:
     if model_output.enable_thinking:
-        exists_think_end = sampler_output.sampled_token_ids == model_output.think_end_id
-        paddle.assign(
-            paddle.where(
-                exists_think_end,
-                model_output.need_think_end - 1,
+        with nvtx.range("enable_thinking"):
+            exists_think_end = sampler_output.sampled_token_ids == model_output.think_end_id
+            paddle.assign(
+                paddle.where(
+                    exists_think_end,
+                    model_output.need_think_end - 1,
+                    model_output.need_think_end,
+                ),
                 model_output.need_think_end,
-            ),
-            model_output.need_think_end,
-        )
+            )
 
-        paddle.assign(
-            paddle.where(
-                model_output.need_think_end.cast("bool"),
-                model_output.reasoning_index - 1,
+            paddle.assign(
+                paddle.where(
+                    model_output.need_think_end.cast("bool"),
+                    model_output.reasoning_index - 1,
+                    model_output.reasoning_index,
+                ),
                 model_output.reasoning_index,
-            ),
-            model_output.reasoning_index,
-        )
+            )
 
-        stop_wo_think = (
-            (sampler_output.sampled_token_ids == model_output.eos_token_id) | (model_output.reasoning_index == 0)
-        ) & (model_output.need_think_end > 0)
-        sampler_output.sampled_token_ids = paddle.where(
-            stop_wo_think,
-            model_output.think_end_id,
-            sampler_output.sampled_token_ids,
-        )
+            stop_wo_think = (
+                (sampler_output.sampled_token_ids == model_output.eos_token_id) | (model_output.reasoning_index == 0)
+            ) & (model_output.need_think_end > 0)
+            sampler_output.sampled_token_ids = paddle.where(
+                stop_wo_think,
+                model_output.think_end_id,
+                sampler_output.sampled_token_ids,
+            )
+            paddle.assign(
+                paddle.where(
+                    stop_wo_think,
+                    model_output.need_think_end - 1,
+                    model_output.need_think_end,
+                ),
+                model_output.need_think_end,
+            )
+    # 1. Set stop value
+    with nvtx.range("set_top_value"):
         paddle.assign(
             paddle.where(
-                stop_wo_think,
-                model_output.need_think_end - 1,
-                model_output.need_think_end,
+                model_output.stop_flags,
+                model_output.step_idx,
+                model_output.step_idx + 1,
             ),
-            model_output.need_think_end,
-        )
-    # 1. Set stop value
-    paddle.assign(
-        paddle.where(
-            model_output.stop_flags,
             model_output.step_idx,
-            model_output.step_idx + 1,
-        ),
-        model_output.step_idx,
-    )
-    length_cond = paddle.greater_equal(model_output.step_idx, model_output.max_dec_len)
-    paddle.assign(
-        paddle.logical_or(model_output.stop_flags, length_cond),
-        model_output.stop_flags,
-    )
+        )
+        length_cond = paddle.greater_equal(model_output.step_idx, model_output.max_dec_len)
+        paddle.assign(
+            paddle.logical_or(model_output.stop_flags, length_cond),
+            model_output.stop_flags,
+        )
 
     if current_platform.is_cuda() or current_platform.is_iluvatar():
-        set_stop_value_multi_ends(
-            sampler_output.sampled_token_ids,
-            model_output.stop_flags,
-            model_output.seq_lens_this_time,
-            model_output.eos_token_id,
-            model_output.next_tokens,
-            model_output.pre_ids,
-            model_output.step_idx,
-            model_output.stop_token_ids,
-            model_output.stop_seqs_len,
-            False,
-        )  # multi ends
+        with nvtx.range("set_stop_value_multi_ends"):
+            set_stop_value_multi_ends(
+                sampler_output.sampled_token_ids,
+                model_output.stop_flags,
+                model_output.seq_lens_this_time,
+                model_output.eos_token_id,
+                model_output.next_tokens,
+                model_output.pre_ids,
+                model_output.step_idx,
+                model_output.stop_token_ids,
+                model_output.stop_seqs_len,
+                False,
+            )  # multi ends
     else:
         set_stop_value_multi_ends(
             sampler_output.sampled_token_ids,
@@ -254,36 +259,39 @@ def post_process_normal(
                 block_size,
             )
         else:
-            update_inputs(
-                model_output.stop_flags,
-                model_output.not_need_stop,
-                model_output.seq_lens_this_time,
-                model_output.seq_lens_encoder,
-                model_output.seq_lens_decoder,
-                model_output.input_ids,
-                model_output.stop_nums,
-                sampler_output.sampled_token_ids,
-                model_output.is_block_step,
-            )
+            with nvtx.range("update_inputs"):
+                update_inputs(
+                    model_output.stop_flags,
+                    model_output.not_need_stop,
+                    model_output.seq_lens_this_time,
+                    model_output.seq_lens_encoder,
+                    model_output.seq_lens_decoder,
+                    model_output.input_ids,
+                    model_output.stop_nums,
+                    sampler_output.sampled_token_ids,
+                    model_output.is_block_step,
+                )
     # 3. Transmit the model's output and stop generation signal via message queue.
     #    In the future, we will abandon this approach.
     if not skip_save_output:
         if sampler_output.logprobs_tensors is None:
-            save_output(
-                sampler_output.sampled_token_ids,
-                model_output.not_need_stop,
-                model_output.mp_rank,
-                save_each_rank,  # save_each_rank
-            )
+            with nvtx.range("save_output"):
+                save_output(
+                    sampler_output.sampled_token_ids,
+                    model_output.not_need_stop,
+                    model_output.mp_rank,
+                    save_each_rank,  # save_each_rank
+                )
         else:
-            save_output_topk(
-                sampler_output.sampled_token_ids,
-                sampler_output.logprobs_tensors.logprob_token_ids,
-                sampler_output.logprobs_tensors.logprobs,
-                sampler_output.logprobs_tensors.selected_token_ranks,
-                model_output.not_need_stop,
-                model_output.mp_rank,
-            )
+            with nvtx.range("save_output_topk"):
+                save_output_topk(
+                    sampler_output.sampled_token_ids,
+                    sampler_output.logprobs_tensors.logprob_token_ids,
+                    sampler_output.logprobs_tensors.logprobs,
+                    sampler_output.logprobs_tensors.selected_token_ranks,
+                    model_output.not_need_stop,
+                    model_output.mp_rank,
+                )
 
 
 def post_process_specualate(model_output, save_each_rank: bool = False, skip_save_output: bool = False):

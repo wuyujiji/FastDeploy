@@ -18,6 +18,7 @@ from typing import Optional
 
 import paddle
 from paddle import nn
+from torch.cuda import nvtx
 
 from fastdeploy.config import FDConfig
 from fastdeploy.distributed.communication import tensor_model_parallel_all_reduce
@@ -218,7 +219,8 @@ class LinearBase(nn.Layer):
         Raises:
             NotImplementedError: If the weight dtype is not float8 or act dtype is not equal to weight dtype.
         """
-        linear_out = self.quant_method.apply(self, x)
+        with nvtx.range("linear_base_forward"):
+            linear_out = self.quant_method.apply(self, x)
 
         return linear_out
 
@@ -686,12 +688,15 @@ class RowParallelLinear(LinearBase):
 
     def forward_cuda(self, x: paddle.Tensor) -> paddle.Tensor:
         if self.fd_config.quant_config:
-            out = self.quant_method.apply(self, x)
+            with nvtx.range("row_parallel_quant_method_apply"):
+                out = self.quant_method.apply(self, x)
         else:
-            out = paddle.matmul(x, self.weight)
+            with nvtx.range("row_parallel_matmul"):
+                out = paddle.matmul(x, self.weight)
 
         if self.reduce_results and self.nranks > 1:
-            tensor_model_parallel_all_reduce(out)
+            with nvtx.range("tensor_model_parallel_all_reduce"):
+                tensor_model_parallel_all_reduce(out)
 
         return out
 

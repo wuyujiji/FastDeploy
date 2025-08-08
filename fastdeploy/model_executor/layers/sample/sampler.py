@@ -38,6 +38,7 @@ from fastdeploy.model_executor.layers.sample.ops import (
 )
 from fastdeploy.platforms import current_platform
 from fastdeploy.worker.output import LogprobsTensors, SamplerOutput
+from torch.cuda import nvtx
 
 
 class SamplerProcessor:
@@ -259,36 +260,43 @@ class Sampler(nn.Layer):
         """ """
         num_logprobs = sampling_metadata.max_num_logprobs
         if num_logprobs is not None:
-            raw_logprobs = self.compute_logprobs(logits)
+            with nvtx.range("compute_logprobs"):
+                raw_logprobs = self.compute_logprobs(logits)
 
-        logits = self.processor.apply_token_mask(logits, skip_idx_list)
+        with nvtx.range("apply_token_mask"):
+            logits = self.processor.apply_token_mask(logits, skip_idx_list)
 
-        logits = apply_penalty_multi_scores(
-            sampling_metadata.pre_token_ids,
-            sampling_metadata.prompt_ids,
-            sampling_metadata.prompt_lens,
-            logits,
-            sampling_metadata.repetition_penalties,
-            sampling_metadata.frequency_penalties,
-            sampling_metadata.presence_penalties,
-            sampling_metadata.temperature,
-            sampling_metadata.bad_words_token_ids,
-            sampling_metadata.step_idx,
-            sampling_metadata.min_dec_lens,
-            sampling_metadata.eos_token_ids,
-        )
+        with nvtx.range("apply_penalty_multi_scores"):
+            logits = apply_penalty_multi_scores(
+                sampling_metadata.pre_token_ids,
+                sampling_metadata.prompt_ids,
+                sampling_metadata.prompt_lens,
+                logits,
+                sampling_metadata.repetition_penalties,
+                sampling_metadata.frequency_penalties,
+                sampling_metadata.presence_penalties,
+                sampling_metadata.temperature,
+                sampling_metadata.bad_words_token_ids,
+                sampling_metadata.step_idx,
+                sampling_metadata.min_dec_lens,
+                sampling_metadata.eos_token_ids,
+            )
 
-        probs = F.softmax(logits)
+        with nvtx.range("F.softmax"):
+            probs = F.softmax(logits)
 
-        probs = min_p_sampling(probs, sampling_metadata.min_p)
+        with nvtx.range("min_p_sampling"):
+            probs = min_p_sampling(probs, sampling_metadata.min_p)
 
-        _, next_tokens = top_k_top_p_sampling(
-            probs, sampling_metadata.top_p, sampling_metadata.top_k, seed=sampling_metadata.seed[0, 0]
-        )
+        with nvtx.range("top_k_top_p_sampling"):
+            _, next_tokens = top_k_top_p_sampling(
+                probs, sampling_metadata.top_p, sampling_metadata.top_k, seed=sampling_metadata.seed[0, 0]
+            )
 
-        logprobs_tensors = (
-            None if num_logprobs is None else self.gather_logprobs(raw_logprobs, num_logprobs, token_ids=next_tokens)
-        )
+        with nvtx.range("gather_logprobs"):
+            logprobs_tensors = (
+                None if num_logprobs is None else self.gather_logprobs(raw_logprobs, num_logprobs, token_ids=next_tokens)
+            )
         if sampling_metadata.enable_early_stop:
             # will set the stop batch in stop_flags
             assert sampling_metadata.stop_flags is not None, "need stop_flags for eary stop"

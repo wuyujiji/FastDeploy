@@ -23,6 +23,7 @@ from fastdeploy.model_executor.models.utils import set_weight_attrs
 from fastdeploy.platforms import current_platform
 
 from ..quantization.quant_base import QuantMethodBase
+from torch.cuda import nvtx
 
 
 class MoEMethodBase(QuantMethodBase):
@@ -170,13 +171,16 @@ class MoEMethodBase(QuantMethodBase):
         """
         if layer.ep_size > 1:
             if layer.fd_config.parallel_config.moe_phase.phase == "prefill":
-                self.ep_prefill_runner.clean_low_latency_buffer()
-                return self.apply_ep_prefill(layer, x, gate)
+                with nvtx.range("apply_ep_prefill"):
+                    self.ep_prefill_runner.clean_low_latency_buffer()
+                    return self.apply_ep_prefill(layer, x, gate)
             else:
-                self.ep_decoder_runner.clean_low_latency_buffer()
-                return self.apply_ep_decode(layer, x, gate)
+                with nvtx.range("apply_ep_decode"):
+                    self.ep_decoder_runner.clean_low_latency_buffer()
+                    return self.apply_ep_decode(layer, x, gate)
         else:
-            return self.apply_tp(layer, x, gate)
+            with nvtx.range("apply_tp"):
+                return self.apply_tp(layer, x, gate)
 
 
 class UnquantizedFusedMoEMethod(MoEMethodBase):

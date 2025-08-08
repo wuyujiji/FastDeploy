@@ -24,6 +24,8 @@ from fastdeploy.platforms import current_platform
 if current_platform.is_gcu():
     from fastdeploy.model_executor.ops.gcu import top_p_sampling as gcu_top_p_sampling
 
+from torch.cuda import nvtx
+
 
 def top_k_top_p_sampling(
     x: paddle.Tensor,
@@ -140,12 +142,13 @@ def rejection_top_p_sampling(
             )
 
         if paddle.count_nonzero(top_k) == 0:
-            ids = rejection_top_p_sampling(
-                x,
-                top_p,
-                None,
-                seed,
-            )
+            with nvtx.range("rejection_top_p_sampling"):
+                ids = rejection_top_p_sampling(
+                    x,
+                    top_p,
+                    None,
+                    seed,
+                )
         else:
             if order == "top_k_first":
                 renorm_probs = top_k_renorm_probs(x, top_k)

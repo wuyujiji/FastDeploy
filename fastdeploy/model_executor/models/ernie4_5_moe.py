@@ -48,6 +48,7 @@ from fastdeploy.model_executor.models.tp_utils import TensorSplitMode as tsm
 from fastdeploy.model_executor.models.utils import LayerIdPlaceholder as layerid
 from fastdeploy.model_executor.models.utils import WeightMeta
 from fastdeploy.platforms import current_platform
+from torch.cuda import nvtx
 
 
 class Ernie4_5_MLP(nn.Layer):
@@ -89,9 +90,12 @@ class Ernie4_5_MLP(nn.Layer):
         self.down_proj.load_state_dict(state_dict)
 
     def forward(self, hidden_states: paddle.Tensor):
-        gate_up_out = self.up_gate_proj(hidden_states)
-        act_out = self.act_fn(gate_up_out)
-        down_out = self.down_proj(act_out)
+        with nvtx.range("gate_up_proj"):
+            gate_up_out = self.up_gate_proj(hidden_states)
+        with nvtx.range("act_fn"):
+            act_out = self.act_fn(gate_up_out)
+        with nvtx.range("down_proj"):
+            down_out = self.down_proj(act_out)
         return down_out
 
 
@@ -184,9 +188,11 @@ class Ernie4_5_MoE(nn.Layer):
             self.shared_experts.load_state_dict(state_dict)
 
     def forward(self, hidden_states: paddle.Tensor):
-        out = self.experts(hidden_states, self.gate)
+        with nvtx.range("routed_experts"):
+            out = self.experts(hidden_states, self.gate)
         if self.num_shared_experts > 0:
-            s_x = self.shared_experts(hidden_states)
+            with nvtx.range("shared_experts"):
+                s_x = self.shared_experts(hidden_states)
             out = out + s_x
         return out
 
@@ -223,14 +229,16 @@ class Ernie4_5_Attention(nn.Layer):
         forward_meta: ForwardMeta,
         hidden_states: paddle.Tensor,
     ):
-        qkv_out = self.qkv_proj(hidden_states)
+        with nvtx.range("qkv_proj"):
+            qkv_out = self.qkv_proj(hidden_states)
 
-        attn_out = self.attn(
-            qkv=qkv_out,
-            forward_meta=forward_meta,
-        )
-
-        output = self.o_proj(attn_out)
+        with nvtx.range("attention"):
+            attn_out = self.attn(
+                qkv=qkv_out,
+                forward_meta=forward_meta,
+            )
+        with nvtx.range("o_proj"):
+            output = self.o_proj(attn_out)
 
         return output
 
@@ -292,20 +300,24 @@ class Ernie4_5_DecoderLayer(nn.Layer):
         hidden_states: paddle.Tensor,
         residual: paddle.Tensor = None,
     ):
-        if residual is None:
-            residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
-        else:
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        with nvtx.range("input_layernorm"):
+            if residual is None:
+                residual = hidden_states
+                hidden_states = self.input_layernorm(hidden_states)
+            else:
+                hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
-        hidden_states = self.self_attn(
-            hidden_states=hidden_states,
-            forward_meta=forward_meta,
-        )
+        with nvtx.range("self_attn"):
+            hidden_states = self.self_attn(
+                hidden_states=hidden_states,
+                forward_meta=forward_meta,
+            )
 
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        with nvtx.range("post_attention_layernorm"):
+            hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
 
-        hidden_states = self.mlp(hidden_states)
+        with nvtx.range("mlp"):
+            hidden_states = self.mlp(hidden_states)
 
         return hidden_states, residual
 
@@ -372,18 +384,21 @@ class Ernie4_5_Model(nn.Layer):
         ids_remove_padding: paddle.Tensor,
         forward_meta: ForwardMeta,
     ):
-        hidden_states = self.embed_tokens(ids_remove_padding=ids_remove_padding)
+        with nvtx.range("embedding"):
+            hidden_states = self.embed_tokens(ids_remove_padding=ids_remove_padding)
 
         if current_platform.is_iluvatar() and forward_meta.attn_backend.mixed:
             hidden_states = forward_meta.attn_backend.transpose(hidden_states)
 
         residual = None
         for i in range(self.num_layers):
-            hidden_states, residual = self.layers[i](forward_meta, hidden_states, residual)
+            with nvtx.range(f"layer{i} forward"):
+                hidden_states, residual = self.layers[i](forward_meta, hidden_states, residual)
 
         hidden_states = hidden_states + residual
 
-        out = self.norm(hidden_states)
+        with nvtx.range(f"final_norm"):
+            out = self.norm(hidden_states)
 
         if current_platform.is_iluvatar() and forward_meta.attn_backend.mixed:
             out = forward_meta.attn_backend.reverse_transpose(out)        
@@ -436,7 +451,8 @@ class Ernie4_5_MoeForCausalLM(ModelForCasualLM):
             self.lm_head.load_state_dict(state_dict)
 
     def compute_logits(self, hidden_states: paddle.Tensor):
-        logits = self.lm_head(hidden_states)
+        with nvtx.range("lm_head"):
+            logits = self.lm_head(hidden_states)
         logits = paddle.cast(logits, paddle.float32)
         logits[:, self.ori_vocab_size :] = -float("inf")
 

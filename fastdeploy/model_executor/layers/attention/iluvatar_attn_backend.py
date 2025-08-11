@@ -30,7 +30,10 @@ from fastdeploy.model_executor.layers.attention.base_attention_backend import (
     AttentionBackend,
     AttentionMetadata,
 )
-from fastdeploy.model_executor.ops.iluvatar import paged_attention
+from fastdeploy.model_executor.ops.iluvatar import (
+    paged_attention,
+    prefill_fused_paged_attention
+)
 
 if TYPE_CHECKING:
     from fastdeploy.model_executor.forward_meta import ForwardMeta
@@ -112,6 +115,8 @@ class IluvatarAttnBackend(AttentionBackend):
 
         self.record_block_table_metadata = {}
         self.enable_fused_attention = int(os.getenv("FD_ILUVATAR_ENABLE_FUSED_ATTN", 1))
+        self.enable_prefill_fused_attention = int(
+            os.getenv("FD_ILUVATAR_ENABLE_PREFILL_FUSED_ATTN", 0))
 
     def init_attention_metadata(self, forward_meta: ForwardMeta):
         """Initialize attntion metadata hence all layers in the forward pass can reuse it."""
@@ -329,29 +334,51 @@ class IluvatarAttnBackend(AttentionBackend):
         return self.merged_output
 
     def forward_prefill(self, prefill_qkv, layer_id, k_cache_id, v_cache_id, forward_meta: ForwardMeta):
-        prefill_q, prefill_k, prefill_v = self.get_splited_qkv(
-            prefill_qkv,
-            forward_meta,
-            self.prefill_info_dict["cu_seqlens_q"],
-            batch_ids=self.prefill_info_dict["batch_ids"],
-        )
-
-        prefill_out = flash_attn_unpadded(
-            prefill_q,
-            prefill_k,
-            prefill_v,
-            cu_seqlens_q=self.prefill_info_dict["cu_seqlens_q"],
-            cu_seqlens_k=self.prefill_info_dict["cu_seqlens_q"],
-            max_seqlen_q=self.attention_metadata.max_context_len,
-            max_seqlen_k=self.attention_metadata.max_context_len,
-            scale=self.attention_metadata.scale,
-            dropout=self.attention_metadata.dropout,
-            causal=self.attention_metadata.causal,
-            return_softmax=self.attention_metadata.return_softmax,
-        )[0]
-        self.prefill_update_kv_cache(
-            prefill_k, prefill_v, k_cache_id, v_cache_id, layer_id, forward_meta, self.prefill_info_dict["batch_ids"]
-        )
+        if self.enable_prefill_fused_attention:
+            k_cache = forward_meta.caches[k_cache_id]
+            v_cache = forward_meta.caches[v_cache_id]
+            rope_cos = forward_meta.rotary_embs[0, 0, :, :, :]
+            rope_sin = forward_meta.rotary_embs[1, 0, :, :, :]
+            prefill_out = prefill_fused_paged_attention(
+                prefill_qkv.view([-1, self.total_num_heads, self.head_dim]),
+                k_cache,
+                v_cache,
+                block_tables=forward_meta.block_tables[
+                    self.prefill_info_dict["batch_ids"], :],
+                cu_seqlens_qkv=self.prefill_info_dict["cu_seqlens_q"],
+                num_kv_heads=self.attention_metadata.num_kv_heads,
+                block_size=self.attention_metadata.block_size,
+                max_seq_len=self.attention_metadata.max_context_len,
+                scale=self.attention_metadata.scale,
+                causal=self.attention_metadata.causal,
+                q_rope=True,
+                k_rope=True,
+                v_rope=False,
+                rope_sin=rope_sin,
+                rope_cos=rope_cos)
+        else:
+            prefill_q, prefill_k, prefill_v = self.get_splited_qkv(
+                prefill_qkv,
+                forward_meta,
+                self.prefill_info_dict["cu_seqlens_q"],
+                batch_ids=self.prefill_info_dict["batch_ids"],
+            )
+            prefill_out = flash_attn_unpadded(
+                prefill_q,
+                prefill_k,
+                prefill_v,
+                cu_seqlens_q=self.prefill_info_dict["cu_seqlens_q"],
+                cu_seqlens_k=self.prefill_info_dict["cu_seqlens_q"],
+                max_seqlen_q=self.attention_metadata.max_context_len,
+                max_seqlen_k=self.attention_metadata.max_context_len,
+                scale=self.attention_metadata.scale,
+                dropout=self.attention_metadata.dropout,
+                causal=self.attention_metadata.causal,
+                return_softmax=self.attention_metadata.return_softmax,
+            )[0]
+            self.prefill_update_kv_cache(
+                prefill_k, prefill_v, k_cache_id, v_cache_id, layer_id, forward_meta, self.prefill_info_dict["batch_ids"]
+            )
 
         return prefill_out
 

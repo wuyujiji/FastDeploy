@@ -17,7 +17,10 @@
 import paddle
 
 try:
-    from fastdeploy.model_executor.ops.iluvatar import paged_attn
+    from fastdeploy.model_executor.ops.iluvatar import (
+        paged_attn,
+        prefill_fused_paged_attn
+    )
 except ImportError:
     paged_attn = None
 
@@ -67,5 +70,42 @@ def paged_attention(
         use_cuda_graph,
         use_sqrt_alibi,
         merged_qkv,
+    )
+    return output[0] if isinstance(output, list) else output
+
+
+def prefill_fused_paged_attention(
+    qkv: paddle.Tensor,
+    k_cache: paddle.Tensor,
+    v_cache: paddle.Tensor,
+    block_tables: paddle.Tensor,
+    cu_seqlens_qkv: paddle.Tensor,
+    num_kv_heads: int,
+    block_size: int,
+    max_seq_len: int,
+    scale: float,
+    causal: bool = True,
+    q_rope: bool = True,
+    k_rope: bool = True,
+    v_rope: bool = False,
+    rope_sin: paddle.Tensor = None,
+    rope_cos: paddle.Tensor = None
+):
+    output = prefill_fused_paged_attn(
+        qkv,
+        k_cache,
+        v_cache,
+        block_tables,
+        cu_seqlens_qkv,
+        rope_sin,
+        rope_cos,
+        num_kv_heads,
+        block_size,
+        max_seq_len,
+        scale,
+        causal,
+        q_rope,
+        k_rope,
+        v_rope
     )
     return output[0] if isinstance(output, list) else output

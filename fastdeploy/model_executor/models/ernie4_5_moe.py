@@ -47,6 +47,7 @@ from fastdeploy.model_executor.models.model_base import ModelForCasualLM
 from fastdeploy.model_executor.models.tp_utils import TensorSplitMode as tsm
 from fastdeploy.model_executor.models.utils import LayerIdPlaceholder as layerid
 from fastdeploy.model_executor.models.utils import WeightMeta
+from fastdeploy.platforms import current_platform
 
 
 class Ernie4_5_MLP(nn.Layer):
@@ -373,6 +374,9 @@ class Ernie4_5_Model(nn.Layer):
     ):
         hidden_states = self.embed_tokens(ids_remove_padding=ids_remove_padding)
 
+        if current_platform.is_iluvatar() and forward_meta.attn_backend.mixed:
+            hidden_states = forward_meta.attn_backend.transpose(hidden_states)
+
         residual = None
         for i in range(self.num_layers):
             hidden_states, residual = self.layers[i](forward_meta, hidden_states, residual)
@@ -380,6 +384,9 @@ class Ernie4_5_Model(nn.Layer):
         hidden_states = hidden_states + residual
 
         out = self.norm(hidden_states)
+
+        if current_platform.is_iluvatar() and forward_meta.attn_backend.mixed:
+            out = forward_meta.attn_backend.reverse_transpose(out)        
 
         return out
 

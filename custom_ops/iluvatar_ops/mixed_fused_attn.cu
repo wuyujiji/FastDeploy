@@ -88,7 +88,7 @@ void MixedFusedPagedAttnKernel(const paddle::Tensor& qkv,
                       common::errors::InvalidArgument(
                           "prefill_rope_dims[0] must be equal to prefill_batch_size"));
     prefill_rope_shape_vec = std::vector<int>({prefill_batch_size, max_seq_len, head_dim});
-    prefill_rope_stride_vec = std::vector<int>({max_seq_len * head_dim, 1});
+    prefill_rope_stride_vec = std::vector<int>({max_seq_len * head_dim, head_dim, 1});
     prefill_rope_ndim = 3;
   } else if (prefill_rope_dims.size() == 3) {
     // [max_seq_len, 1, head_dim]

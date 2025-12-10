@@ -152,7 +152,7 @@ void PrefillFusedPagedAttnKernel(
                         common::errors::InvalidArgument(
                             "rope_dims[0] must be equal to batch_size"));
       rope_shape_vec = std::vector<int>({batch_size, max_seq_len, head_dim});
-      rope_stride_vec = std::vector<int>({max_seq_len * head_dim, 1});
+      rope_stride_vec = std::vector<int>({max_seq_len * head_dim, head_dim, 1});
       rope_ndim = 3;
   } else if (rope_dims.size() == 3) {
       // [max_seq_len, 1, head_dim]

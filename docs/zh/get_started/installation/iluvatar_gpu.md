@@ -477,7 +477,7 @@ python3 -m fastdeploy.entrypoints.openai.api_server \
        --cache-queue-port 55660 \
        --max-model-len 16384 \
        --max-num-batched-tokens 16384 \
-       --max-num-seqs 256 \
+       --max-num-seqs 32 \
        --workers 2 \
        --block-size 16
 ```

@@ -104,6 +104,7 @@ from fastdeploy.worker.model_runner_base import (
     ModelRunnerBase,
 )
 from fastdeploy.worker.output import LogprobsTensors, ModelOutputData, ModelRunnerOutput
+from torch.cuda import nvtx
 
 
 class GPUModelRunner(ModelRunnerBase):
@@ -435,155 +436,169 @@ class GPUModelRunner(ModelRunnerBase):
                 rope_3d_position_ids["max_tokens_lst"].append(request.get("max_tokens", 2048))
 
             if request.with_image:
-                inputs = request.multimodal_inputs
-                if self.encoder_cache is not None:
-                    if envs.FD_ENABLE_MAX_PREFILL:
-                        if "vit_seqlen" in inputs:
-                            vit_seqlen_list = inputs["vit_seqlen"][request.num_image_start : request.num_image_end]
-                        if "vit_position_ids" in inputs:
-                            vit_position_ids_list = inputs["vit_position_ids"][
-                                request.num_image_start : request.num_image_end
-                            ]
-                    grid_thw_list = inputs["grid_thw"][request.num_image_start : request.num_image_end]
-                    mm_hashes_list = inputs["mm_hashes"][request.num_image_start : request.num_image_end]
-                    feature_positions = self._get_feature_positions(
-                        mm_positions=inputs["mm_positions"][request.num_image_start : request.num_image_end],
-                        prefill_start_index=request.prefill_start_index,
-                        prefill_end_index=request.prefill_end_index,
-                    )
-                    image_start_idx = request.num_image_start
-
-                    logger.debug(
-                        f"request {request.request_id} start process encoder info, image_start_idx: {image_start_idx} "
-                        f"grid_thw_list: {grid_thw_list}, feature_positions: {feature_positions}, mm_hashes_list: {mm_hashes_list}"
-                    )
-                    for i, mm_hash in enumerate(mm_hashes_list):
-                        image_offset = np.prod(grid_thw_list[i])
-                        logger.debug(
-                            f"run idx {i} with mm_hash {mm_hash} image_offset: {image_offset} grid_thw: {grid_thw_list[i]}"
-                        )
-                        if mm_hash in self.encoder_cache:
-                            multi_vision_inputs["encoder_cache_info"].append((mm_hash, feature_positions[i], True))
-                            continue
-
-                        multi_vision_inputs["encoder_cache_info"].append((mm_hash, feature_positions[i], False))
-                        if envs.FD_ENABLE_MAX_PREFILL:
-                            multi_vision_inputs["images_lst"].append(
-                                inputs["images"][image_start_idx : image_start_idx + image_offset].to(self.device)
-                            )
-                            multi_vision_inputs["grid_thw_lst"].append(paddle.to_tensor(grid_thw_list[i]))
-                            multi_vision_inputs["cu_seqlens"].append(vit_seqlen_list[i])
-                            multi_vision_inputs["vit_position_ids_lst"].append(vit_position_ids_list[i])
-                        else:
-                            multi_vision_inputs["images_lst"].append(
-                                paddle.to_tensor(
-                                    inputs["images"][image_start_idx : image_start_idx + image_offset],
-                                    dtype="uint8" if "ernie" in self.model_config.model_type else "bfloat16",
+                with nvtx.range("request_with_image"):
+                    inputs = request.multimodal_inputs
+                    if self.encoder_cache is not None:
+                        with nvtx.range("encoder_cache_is_not_None"):
+                            if envs.FD_ENABLE_MAX_PREFILL:
+                                if "vit_seqlen" in inputs:
+                                    vit_seqlen_list = inputs["vit_seqlen"][request.num_image_start : request.num_image_end]
+                                if "vit_position_ids" in inputs:
+                                    vit_position_ids_list = inputs["vit_position_ids"][
+                                        request.num_image_start : request.num_image_end
+                                    ]
+                            grid_thw_list = inputs["grid_thw"][request.num_image_start : request.num_image_end]
+                            mm_hashes_list = inputs["mm_hashes"][request.num_image_start : request.num_image_end]
+                            with nvtx.range("_get_feature_positions"):
+                                feature_positions = self._get_feature_positions(
+                                    mm_positions=inputs["mm_positions"][request.num_image_start : request.num_image_end],
+                                    prefill_start_index=request.prefill_start_index,
+                                    prefill_end_index=request.prefill_end_index,
                                 )
-                            )
-                            multi_vision_inputs["grid_thw_lst"].append(
-                                paddle.to_tensor(grid_thw_list[i], dtype=paddle.int64)
-                            )
-                        image_start_idx += image_offset
-                else:
-                    if envs.FD_ENABLE_MAX_PREFILL:
-                        multi_vision_inputs["images_lst"].append(
-                            inputs["images"][request.image_start : request.image_end].to(self.device)
-                        )
-                        multi_vision_inputs["grid_thw_lst"].extend(
-                            paddle.to_tensor(inputs["grid_thw"][request.num_image_start : request.num_image_end])
-                        )
-                        multi_vision_inputs["cu_seqlens"].extend(
-                            inputs["vit_seqlen"][request.num_image_start : request.num_image_end]
-                        )
-                        multi_vision_inputs["vit_position_ids_lst"].extend(
-                            inputs["vit_position_ids"][request.num_image_start : request.num_image_end]
-                        )
-                    else:
-                        multi_vision_inputs["images_lst"].append(
-                            paddle.to_tensor(
-                                inputs["images"][request.image_start : request.image_end],
-                                dtype="uint8" if "ernie" in self.model_config.model_type else "bfloat16",
-                            )
-                        )
-                        multi_vision_inputs["grid_thw_lst"].extend(
-                            paddle.to_tensor(
-                                inputs["grid_thw"][request.num_image_start : request.num_image_end],
-                                dtype=paddle.int64,
-                            )
-                        )
+                            image_start_idx = request.num_image_start
 
-                    multi_vision_inputs["feature_position_list"].extend(
-                        self._get_feature_positions(
-                            mm_positions=inputs["mm_positions"][request.num_image_start : request.num_image_end],
-                            prefill_start_index=request.prefill_start_index,
-                            prefill_end_index=request.prefill_end_index,
-                        )
-                    )
+                            logger.debug(
+                                f"request {request.request_id} start process encoder info, image_start_idx: {image_start_idx} "
+                                f"grid_thw_list: {grid_thw_list}, feature_positions: {feature_positions}, mm_hashes_list: {mm_hashes_list}"
+                            )
+                            for i, mm_hash in enumerate(mm_hashes_list):
+                                image_offset = np.prod(grid_thw_list[i])
+                                logger.debug(
+                                    f"run idx {i} with mm_hash {mm_hash} image_offset: {image_offset} grid_thw: {grid_thw_list[i]}"
+                                )
+                                if mm_hash in self.encoder_cache:
+                                    multi_vision_inputs["encoder_cache_info"].append((mm_hash, feature_positions[i], True))
+                                    continue
+
+                                multi_vision_inputs["encoder_cache_info"].append((mm_hash, feature_positions[i], False))
+                                if envs.FD_ENABLE_MAX_PREFILL:
+                                    multi_vision_inputs["images_lst"].append(
+                                        inputs["images"][image_start_idx : image_start_idx + image_offset].to(self.device)
+                                    )
+                                    multi_vision_inputs["grid_thw_lst"].append(paddle.to_tensor(grid_thw_list[i]))
+                                    multi_vision_inputs["cu_seqlens"].append(vit_seqlen_list[i])
+                                    multi_vision_inputs["vit_position_ids_lst"].append(vit_position_ids_list[i])
+                                else:
+                                    multi_vision_inputs["images_lst"].append(
+                                        paddle.to_tensor(
+                                            inputs["images"][image_start_idx : image_start_idx + image_offset],
+                                            dtype="uint8" if "ernie" in self.model_config.model_type else "bfloat16",
+                                        )
+                                    )
+                                    multi_vision_inputs["grid_thw_lst"].append(
+                                        paddle.to_tensor(grid_thw_list[i], dtype=paddle.int64)
+                                    )
+                                image_start_idx += image_offset
+                    else:
+                        with nvtx.range("encoder_cache_is_None"):
+                            if envs.FD_ENABLE_MAX_PREFILL:
+                                multi_vision_inputs["images_lst"].append(
+                                    inputs["images"][request.image_start : request.image_end].to(self.device)
+                                )
+                                multi_vision_inputs["grid_thw_lst"].extend(
+                                    paddle.to_tensor(inputs["grid_thw"][request.num_image_start : request.num_image_end])
+                                )
+                                multi_vision_inputs["cu_seqlens"].extend(
+                                    inputs["vit_seqlen"][request.num_image_start : request.num_image_end]
+                                )
+                                multi_vision_inputs["vit_position_ids_lst"].extend(
+                                    inputs["vit_position_ids"][request.num_image_start : request.num_image_end]
+                                )
+                            else:
+                                multi_vision_inputs["images_lst"].append(
+                                    paddle.to_tensor(
+                                        inputs["images"][request.image_start : request.image_end],
+                                        dtype="uint8" if "ernie" in self.model_config.model_type else "bfloat16",
+                                    )
+                                )
+                                multi_vision_inputs["grid_thw_lst"].extend(
+                                    paddle.to_tensor(
+                                        inputs["grid_thw"][request.num_image_start : request.num_image_end],
+                                        dtype=paddle.int64,
+                                    )
+                                )
+                            with nvtx.range("_get_feature_positions"):
+                                multi_vision_inputs["feature_position_list"].extend(
+                                    self._get_feature_positions(
+                                        mm_positions=inputs["mm_positions"][request.num_image_start : request.num_image_end],
+                                        prefill_start_index=request.prefill_start_index,
+                                        prefill_end_index=request.prefill_end_index,
+                                    )
+                                )
 
         if self.encoder_cache is not None:
-            if len(multi_vision_inputs["images_lst"]) > 0 or len(multi_vision_inputs["encoder_cache_info"]) > 0:
-                image_features_output = None
-                if len(multi_vision_inputs["images_lst"]) > 0:
-                    image_features_output = self.extract_vision_features(multi_vision_inputs)
+            with nvtx.range("encoder_cache_is_not_None"):
+                if len(multi_vision_inputs["images_lst"]) > 0 or len(multi_vision_inputs["encoder_cache_info"]) > 0:
+                    image_features_output = None
+                    if len(multi_vision_inputs["images_lst"]) > 0:
+                        with nvtx.range("extract_vision_features"):
+                            image_features_output = self.extract_vision_features(multi_vision_inputs)
 
-                logger.debug(f"encoder_cache_info: {multi_vision_inputs['encoder_cache_info']}")
+                    logger.debug(f"encoder_cache_info: {multi_vision_inputs['encoder_cache_info']}")
+                    merge_image_features, feature_idx, thw_idx = [], 0, 0
+                    for mm_hash, feature_position, use_cache in multi_vision_inputs["encoder_cache_info"]:
+                        if use_cache:
+                            assert mm_hash in self.encoder_cache, f"{mm_hash} not in encoder cache"
+                            with nvtx.range("use_cache_mm_feature_h2d"):
+                                mm_feature = self.encoder_cache[mm_hash].cuda()
+                        else:
+                            assert (
+                                image_features_output is not None
+                            ), f"image_features_output is None, images_lst length: {len(multi_vision_inputs['images_lst'])}"
+                            grid_thw = multi_vision_inputs["grid_thw_lst"][thw_idx]
+                            mm_token_lenght = (grid_thw[1] * grid_thw[2]) // 4
+                            mm_feature = image_features_output[feature_idx : feature_idx + mm_token_lenght]
+
+                            # add feature to encoder cache
+                            with nvtx.range("non_use_cache_mm_feature_d2h"):
+                                self.encoder_cache[mm_hash] = mm_feature.detach().cpu()
+                            feature_idx += mm_token_lenght
+                            thw_idx += 1
+
+                        feature_start = feature_position.offset
+                        feature_end = feature_position.offset + feature_position.length
+                        merge_image_features.append(mm_feature[feature_start:feature_end])
+
+                    with nvtx.range("concat_image_features"):
+                        self.share_inputs["image_features"] = paddle.concat(merge_image_features, axis=0)
+                    logger.debug(
+                        f"merge_image_features length: {len(merge_image_features)}, features shape: {self.share_inputs['image_features'].shape}"
+                    )
+        elif len(multi_vision_inputs["images_lst"]) > 0:
+            with nvtx.range("image_lst_greater_than_0"):
+                assert len(multi_vision_inputs["feature_position_list"]) == len(
+                    multi_vision_inputs["grid_thw_lst"]
+                ), f"{multi_vision_inputs['feature_position_list']} != {multi_vision_inputs['grid_thw_lst']}"
+
                 merge_image_features, feature_idx, thw_idx = [], 0, 0
-                for mm_hash, feature_position, use_cache in multi_vision_inputs["encoder_cache_info"]:
-                    if use_cache:
-                        assert mm_hash in self.encoder_cache, f"{mm_hash} not in encoder cache"
-                        mm_feature = self.encoder_cache[mm_hash].cuda()
-                    else:
-                        assert (
-                            image_features_output is not None
-                        ), f"image_features_output is None, images_lst length: {len(multi_vision_inputs['images_lst'])}"
-                        grid_thw = multi_vision_inputs["grid_thw_lst"][thw_idx]
-                        mm_token_lenght = (grid_thw[1] * grid_thw[2]) // 4
-                        mm_feature = image_features_output[feature_idx : feature_idx + mm_token_lenght]
-
-                        # add feature to encoder cache
-                        self.encoder_cache[mm_hash] = mm_feature.detach().cpu()
-                        feature_idx += mm_token_lenght
-                        thw_idx += 1
+                with nvtx.range("extract_vision_features"):
+                    image_features_output = self.extract_vision_features(multi_vision_inputs)
+                for feature_position in multi_vision_inputs["feature_position_list"]:
+                    grid_thw = multi_vision_inputs["grid_thw_lst"][thw_idx]
+                    mm_token_lenght = (grid_thw[1] * grid_thw[2]) // 4
+                    mm_feature = image_features_output[feature_idx : feature_idx + mm_token_lenght]
 
                     feature_start = feature_position.offset
                     feature_end = feature_position.offset + feature_position.length
                     merge_image_features.append(mm_feature[feature_start:feature_end])
-
-                self.share_inputs["image_features"] = paddle.concat(merge_image_features, axis=0)
-                logger.debug(
-                    f"merge_image_features length: {len(merge_image_features)}, features shape: {self.share_inputs['image_features'].shape}"
-                )
-        elif len(multi_vision_inputs["images_lst"]) > 0:
-            assert len(multi_vision_inputs["feature_position_list"]) == len(
-                multi_vision_inputs["grid_thw_lst"]
-            ), f"{multi_vision_inputs['feature_position_list']} != {multi_vision_inputs['grid_thw_lst']}"
-
-            merge_image_features, feature_idx, thw_idx = [], 0, 0
-            image_features_output = self.extract_vision_features(multi_vision_inputs)
-            for feature_position in multi_vision_inputs["feature_position_list"]:
-                grid_thw = multi_vision_inputs["grid_thw_lst"][thw_idx]
-                mm_token_lenght = (grid_thw[1] * grid_thw[2]) // 4
-                mm_feature = image_features_output[feature_idx : feature_idx + mm_token_lenght]
-
-                feature_start = feature_position.offset
-                feature_end = feature_position.offset + feature_position.length
-                merge_image_features.append(mm_feature[feature_start:feature_end])
-                feature_idx += mm_token_lenght
-                thw_idx += 1
-            self.share_inputs["image_features"] = paddle.concat(merge_image_features, axis=0)
+                    feature_idx += mm_token_lenght
+                    thw_idx += 1
+                with nvtx.range("concat_image_features"):
+                    self.share_inputs["image_features"] = paddle.concat(merge_image_features, axis=0)
 
         if len(rope_3d_position_ids["position_ids_idx"]) > 0:
-            packed_position_ids = paddle.to_tensor(
-                np.concatenate(rope_3d_position_ids["position_ids_lst"]), dtype="int64"
-            )
-            rope_3d_lst = self.prepare_rope3d(
-                packed_position_ids,
-                rope_3d_position_ids["max_tokens_lst"],
-                rope_3d_position_ids["position_ids_offset"],
-            )
-            for i, idx in enumerate(rope_3d_position_ids["position_ids_idx"]):
-                self.share_inputs["rope_emb"][idx : idx + 1, :] = rope_3d_lst[i]
+            with nvtx.range("position_ids_idx_greater_than_0"):
+                packed_position_ids = paddle.to_tensor(
+                    np.concatenate(rope_3d_position_ids["position_ids_lst"]), dtype="int64"
+                )
+                with nvtx.range("prepare_rope3d"):
+                    rope_3d_lst = self.prepare_rope3d(
+                        packed_position_ids,
+                        rope_3d_position_ids["max_tokens_lst"],
+                        rope_3d_position_ids["position_ids_offset"],
+                    )
+                for i, idx in enumerate(rope_3d_position_ids["position_ids_idx"]):
+                    self.share_inputs["rope_emb"][idx : idx + 1, :] = rope_3d_lst[i]
 
     def _get_feature_positions(
         self, mm_positions: List[ImagePosition], prefill_start_index: int, prefill_end_index: int
@@ -634,7 +649,8 @@ class GPUModelRunner(ModelRunnerBase):
         """
         # NOTE(luotingdan): Lazy initialize kv cache
         if "caches" not in self.share_inputs:
-            self.initialize_kv_cache()
+            with nvtx.range("initialize_kv_cache"):
+                self.initialize_kv_cache()
 
         req_len = len(req_dicts)
         has_prefill_task = False
@@ -653,115 +669,118 @@ class GPUModelRunner(ModelRunnerBase):
             logits_info = None
             prefill_tokens = []
             if request.task_type.value == RequestType.PREFILL.value:  # prefill task
-                # guided decoding
-                if (
-                    request.guided_json is not None
-                    or request.guided_regex is not None
-                    or request.structural_tag is not None
-                    or request.guided_grammar is not None
-                ):
-                    logits_info, schemata_key = self._init_logits_processor(request)
-                    request.schemata_key = schemata_key
+                with nvtx.range("prefill_task"):
+                    # guided decoding
+                    if (
+                        request.guided_json is not None
+                        or request.guided_regex is not None
+                        or request.structural_tag is not None
+                        or request.guided_grammar is not None
+                    ):
+                        logits_info, schemata_key = self._init_logits_processor(request)
+                        request.schemata_key = schemata_key
+
+                        if (
+                            self.scheduler_config.splitwise_role == "decode"
+                            and hasattr(request, "prefill_end_index")
+                            and hasattr(request, "prompt_token_ids")
+                            and request.prefill_end_index > len(request.prompt_token_ids)
+                            and hasattr(request, "output_token_ids")
+                        ):
+                            prefill_tokens.extend(request.output_token_ids)
+
+                    prefill_start_index = request.prefill_start_index
+                    prefill_end_index = request.prefill_end_index
+                    length = prefill_end_index - prefill_start_index
+                    if not self.is_pooling_model:
+                        if request.get("enable_thinking", False) and request.get("reasoning_max_tokens", None) is not None:
+                            # Enable thinking
+                            self.share_inputs["max_think_lens"][idx : idx + 1, :] = request.get("reasoning_max_tokens")
+                            self.share_inputs["limit_think_status"][idx : idx + 1, :] = 0
+                        else:
+                            # Disable thinking
+                            self.share_inputs["max_think_lens"][idx : idx + 1, :] = -1
+                            self.share_inputs["limit_think_status"][idx : idx + 1, :] = 0
+
+                    if isinstance(request.prompt_token_ids, np.ndarray):
+                        prompt_token_ids = request.prompt_token_ids.tolist()
+                    else:
+                        prompt_token_ids = request.prompt_token_ids
+                    input_ids = prompt_token_ids + request.output_token_ids
+                    prompt_len = len(prompt_token_ids)
+                    self.share_inputs["prompt_ids"][idx : idx + 1, :prompt_len] = np.array(prompt_token_ids, dtype="int64")
+                    logger.debug(
+                        f"Handle prefill request {request} at idx {idx}, "
+                        f"{prefill_start_index=}, {prefill_end_index=}, "
+                        f"need_prefilled_token_num={len(input_ids)}"
+                        f"prompt_len={prompt_len}"
+                    )
+                    self.share_inputs["input_ids"][idx : idx + 1, :length] = np.array(
+                        input_ids[prefill_start_index:prefill_end_index]
+                    )
+                    encoder_block_num = len(request.block_tables)
+                    self.share_inputs["encoder_block_lens"][idx : idx + 1] = encoder_block_num
+                    self.share_inputs["block_tables"][idx : idx + 1, :] = -1
+                    self.share_inputs["block_tables"][idx : idx + 1, :encoder_block_num] = np.array(
+                        request.block_tables, dtype="int32"
+                    )
+                    self.share_inputs["stop_flags"][idx : idx + 1] = False
+                    self.share_inputs["seq_lens_decoder"][idx : idx + 1] = prefill_start_index
+                    self.seq_lens_this_time_buffer[idx : idx + 1] = length
+                    self.share_inputs["seq_lens_encoder"][idx : idx + 1] = length
+                    self.share_inputs["step_seq_lens_decoder"][idx : idx + 1] = 0
+                    self.share_inputs["prompt_lens"][idx : idx + 1] = len(input_ids)
+                    self.share_inputs["is_block_step"][idx : idx + 1] = False
+                    self.share_inputs["is_chunk_step"][idx : idx + 1] = prefill_end_index < len(input_ids)
+                    self.share_inputs["step_idx"][idx : idx + 1] = (
+                        len(request.output_token_ids) if prefill_end_index >= len(input_ids) else 0
+                    )
+                    self.share_inputs["pre_ids"][idx : idx + 1] = -1
+                    # pooling model request.sampling_params is None
+                    if request.sampling_params is not None and request.sampling_params.prompt_logprobs is not None:
+                        self.prompt_logprobs_reqs[request.request_id] = request
+                    self.forward_batch_reqs_list[idx] = request
+                    has_prefill_task = True
+
+                    # Routing Replay
+                    if self.fd_config.routing_replay_config.enable_routing_replay:
+                        if prefill_start_index == 0:
+                            self.routing_replay_manager.register_request(batch_id=idx, request_id=request.request_id)
 
                     if (
-                        self.scheduler_config.splitwise_role == "decode"
-                        and hasattr(request, "prefill_end_index")
-                        and hasattr(request, "prompt_token_ids")
-                        and request.prefill_end_index > len(request.prompt_token_ids)
-                        and hasattr(request, "output_token_ids")
-                    ):
-                        prefill_tokens.extend(request.output_token_ids)
-
-                prefill_start_index = request.prefill_start_index
-                prefill_end_index = request.prefill_end_index
-                length = prefill_end_index - prefill_start_index
-                if not self.is_pooling_model:
-                    if request.get("enable_thinking", False) and request.get("reasoning_max_tokens", None) is not None:
-                        # Enable thinking
-                        self.share_inputs["max_think_lens"][idx : idx + 1, :] = request.get("reasoning_max_tokens")
-                        self.share_inputs["limit_think_status"][idx : idx + 1, :] = 0
-                    else:
-                        # Disable thinking
-                        self.share_inputs["max_think_lens"][idx : idx + 1, :] = -1
-                        self.share_inputs["limit_think_status"][idx : idx + 1, :] = 0
-
-                if isinstance(request.prompt_token_ids, np.ndarray):
-                    prompt_token_ids = request.prompt_token_ids.tolist()
-                else:
-                    prompt_token_ids = request.prompt_token_ids
-                input_ids = prompt_token_ids + request.output_token_ids
-                prompt_len = len(prompt_token_ids)
-                self.share_inputs["prompt_ids"][idx : idx + 1, :prompt_len] = np.array(prompt_token_ids, dtype="int64")
-                logger.debug(
-                    f"Handle prefill request {request} at idx {idx}, "
-                    f"{prefill_start_index=}, {prefill_end_index=}, "
-                    f"need_prefilled_token_num={len(input_ids)}"
-                    f"prompt_len={prompt_len}"
-                )
-                self.share_inputs["input_ids"][idx : idx + 1, :length] = np.array(
-                    input_ids[prefill_start_index:prefill_end_index]
-                )
-                encoder_block_num = len(request.block_tables)
-                self.share_inputs["encoder_block_lens"][idx : idx + 1] = encoder_block_num
-                self.share_inputs["block_tables"][idx : idx + 1, :] = -1
-                self.share_inputs["block_tables"][idx : idx + 1, :encoder_block_num] = np.array(
-                    request.block_tables, dtype="int32"
-                )
-                self.share_inputs["stop_flags"][idx : idx + 1] = False
-                self.share_inputs["seq_lens_decoder"][idx : idx + 1] = prefill_start_index
-                self.seq_lens_this_time_buffer[idx : idx + 1] = length
-                self.share_inputs["seq_lens_encoder"][idx : idx + 1] = length
-                self.share_inputs["step_seq_lens_decoder"][idx : idx + 1] = 0
-                self.share_inputs["prompt_lens"][idx : idx + 1] = len(input_ids)
-                self.share_inputs["is_block_step"][idx : idx + 1] = False
-                self.share_inputs["is_chunk_step"][idx : idx + 1] = prefill_end_index < len(input_ids)
-                self.share_inputs["step_idx"][idx : idx + 1] = (
-                    len(request.output_token_ids) if prefill_end_index >= len(input_ids) else 0
-                )
-                self.share_inputs["pre_ids"][idx : idx + 1] = -1
-                # pooling model request.sampling_params is None
-                if request.sampling_params is not None and request.sampling_params.prompt_logprobs is not None:
-                    self.prompt_logprobs_reqs[request.request_id] = request
-                self.forward_batch_reqs_list[idx] = request
-                has_prefill_task = True
-
-                # Routing Replay
-                if self.fd_config.routing_replay_config.enable_routing_replay:
-                    if prefill_start_index == 0:
-                        self.routing_replay_manager.register_request(batch_id=idx, request_id=request.request_id)
-
-                if (
-                    self.fd_config.scheduler_config.splitwise_role == "decode"
-                ):  # In PD, we continue to decode after P generate first token
-                    self.share_inputs["seq_lens_encoder"][idx : idx + 1] = 0
+                        self.fd_config.scheduler_config.splitwise_role == "decode"
+                    ):  # In PD, we continue to decode after P generate first token
+                        self.share_inputs["seq_lens_encoder"][idx : idx + 1] = 0
             elif request.task_type.value == RequestType.DECODE.value:  # decode task
-                logger.debug(f"Handle decode request {request} at idx {idx}")
-                encoder_block_num = len(request.block_tables)
-                self.share_inputs["encoder_block_lens"][idx : idx + 1] = encoder_block_num
-                self.share_inputs["block_tables"][idx : idx + 1, :] = -1
-                self.share_inputs["block_tables"][idx : idx + 1, :encoder_block_num] = np.array(
-                    request.block_tables, dtype="int32"
-                )
-                if self.share_inputs["is_block_step"][idx]:  # has tasks to continue to decode
-                    has_decode_task = True
-                continue
+                with nvtx.range("decode_task"):
+                    logger.debug(f"Handle decode request {request} at idx {idx}")
+                    encoder_block_num = len(request.block_tables)
+                    self.share_inputs["encoder_block_lens"][idx : idx + 1] = encoder_block_num
+                    self.share_inputs["block_tables"][idx : idx + 1, :] = -1
+                    self.share_inputs["block_tables"][idx : idx + 1, :encoder_block_num] = np.array(
+                        request.block_tables, dtype="int32"
+                    )
+                    if self.share_inputs["is_block_step"][idx]:  # has tasks to continue to decode
+                        has_decode_task = True
+                    continue
             else:  # preempted task
-                logger.info(f"Handle preempted request {request} at idx {idx}")
-                self.share_inputs["block_tables"][idx : idx + 1, :] = -1
-                self.share_inputs["stop_flags"][idx : idx + 1] = True
-                self.seq_lens_this_time_buffer[idx : idx + 1] = 0
-                self.share_inputs["seq_lens_decoder"][idx : idx + 1] = 0
-                self.share_inputs["seq_lens_encoder"][idx : idx + 1] = 0
-                self.share_inputs["is_block_step"][idx : idx + 1] = False
-                self.prompt_logprobs_reqs.pop(request.request_id, None)
-                self.in_progress_prompt_logprobs.pop(request.request_id, None)
-                self.forward_batch_reqs_list[idx] = None
+                with nvtx.range("preempted_task"):
+                    logger.info(f"Handle preempted request {request} at idx {idx}")
+                    self.share_inputs["block_tables"][idx : idx + 1, :] = -1
+                    self.share_inputs["stop_flags"][idx : idx + 1] = True
+                    self.seq_lens_this_time_buffer[idx : idx + 1] = 0
+                    self.share_inputs["seq_lens_decoder"][idx : idx + 1] = 0
+                    self.share_inputs["seq_lens_encoder"][idx : idx + 1] = 0
+                    self.share_inputs["is_block_step"][idx : idx + 1] = False
+                    self.prompt_logprobs_reqs.pop(request.request_id, None)
+                    self.in_progress_prompt_logprobs.pop(request.request_id, None)
+                    self.forward_batch_reqs_list[idx] = None
 
-                # Routing Replay
-                if self.fd_config.routing_replay_config.enable_routing_replay:
-                    self.routing_replay_manager.clear_request(batch_id=idx)
+                    # Routing Replay
+                    if self.fd_config.routing_replay_config.enable_routing_replay:
+                        self.routing_replay_manager.clear_request(batch_id=idx)
 
-                continue
+                    continue
 
             assert len(request.eos_token_ids) == self.model_config.eos_tokens_lens
             self.share_inputs["eos_token_id"][:] = np.array(request.eos_token_ids, dtype="int64").reshape(-1, 1)
@@ -817,9 +836,11 @@ class GPUModelRunner(ModelRunnerBase):
             # For logits processors
             self.share_inputs["logits_processors_args"][idx] = request.get("logits_processors_args") or {}
 
-            self.sampler.apply_logits_processor(idx, logits_info, prefill_tokens)
+            with nvtx.range("apply_logits_processor"):
+                self.sampler.apply_logits_processor(idx, logits_info, prefill_tokens)
 
-        self._process_mm_features(req_dicts)
+        with nvtx.range("_process_mm_features"):
+            self._process_mm_features(req_dicts)
         if has_prefill_task or has_decode_task:
             self.share_inputs["not_need_stop"][0] = True
         self.share_inputs["seq_lens_this_time"] = self.seq_lens_this_time_buffer[:num_running_requests]
@@ -1395,20 +1416,21 @@ class GPUModelRunner(ModelRunnerBase):
     def _prepare_inputs(self, is_dummy_or_profile_run=False) -> None:
         """Prepare the model inputs"""
         if envs.ENABLE_V1_KVCACHE_SCHEDULER:
-            recover_decode_task(
-                self.share_inputs["stop_flags"],
-                self.share_inputs["seq_lens_this_time"],
-                self.share_inputs["seq_lens_encoder"],
-                self.share_inputs["seq_lens_decoder"],
-                self.share_inputs["step_seq_lens_decoder"],
-                self.share_inputs["block_tables"],
-                self.share_inputs["is_block_step"],
-                self.share_inputs["draft_tokens"] if self.speculative_decoding else None,
-                self.share_inputs["step_draft_tokens"] if self.speculative_decoding else None,
-                self.share_inputs["step_seq_lens_this_time"] if self.speculative_decoding else None,
-                self.cache_config.block_size,
-                self.speculative_config.num_speculative_tokens if self.speculative_decoding else 0,
-            )
+            with nvtx.range("recover_decode_task"):
+                recover_decode_task(
+                    self.share_inputs["stop_flags"],
+                    self.share_inputs["seq_lens_this_time"],
+                    self.share_inputs["seq_lens_encoder"],
+                    self.share_inputs["seq_lens_decoder"],
+                    self.share_inputs["step_seq_lens_decoder"],
+                    self.share_inputs["block_tables"],
+                    self.share_inputs["is_block_step"],
+                    self.share_inputs["draft_tokens"] if self.speculative_decoding else None,
+                    self.share_inputs["step_draft_tokens"] if self.speculative_decoding else None,
+                    self.share_inputs["step_seq_lens_this_time"] if self.speculative_decoding else None,
+                    self.cache_config.block_size,
+                    self.speculative_config.num_speculative_tokens if self.speculative_decoding else 0,
+                )
             logprobs_reqs = [
                 req
                 for req in self.forward_batch_reqs_list
@@ -1429,28 +1451,30 @@ class GPUModelRunner(ModelRunnerBase):
                 self.max_logprobs = None if not self.speculative_decoding else 0
 
         # Remove padding
-        (
-            ids_remove_padding,
-            batch_id_per_token,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            output_cum_offsets,
-            output_padding_offset,
-        ) = pre_process(
-            self.share_inputs["input_ids"],
-            self.share_inputs["seq_lens_this_time"],
-            self.speculative_decoding,
-            (self.share_inputs["draft_tokens"] if self.speculative_decoding else None),
-            self.share_inputs["seq_lens_encoder"],
-            self.share_inputs["seq_lens_decoder"],
-        )
+        with nvtx.range("pre_process"):
+            (
+                ids_remove_padding,
+                batch_id_per_token,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                output_cum_offsets,
+                output_padding_offset,
+            ) = pre_process(
+                self.share_inputs["input_ids"],
+                self.share_inputs["seq_lens_this_time"],
+                self.speculative_decoding,
+                (self.share_inputs["draft_tokens"] if self.speculative_decoding else None),
+                self.share_inputs["seq_lens_encoder"],
+                self.share_inputs["seq_lens_decoder"],
+            )
 
-        self.share_inputs["ids_remove_padding"].copy_(ids_remove_padding, False)
-        # NOTE: (changwenbin) Initialized to max_num_seq '-1' before copying, marking illegal positions
-        self.share_inputs["batch_id_per_token"][:] = -1
-        self.share_inputs["batch_id_per_token"].copy_(batch_id_per_token, False)
-        self.share_inputs["cu_seqlens_q"].copy_(cu_seqlens_q, False)
-        self.share_inputs["cu_seqlens_k"].copy_(cu_seqlens_k, False)
+        with nvtx.range("copy_to_share_inputs"):
+            self.share_inputs["ids_remove_padding"].copy_(ids_remove_padding, False)
+            # NOTE: (changwenbin) Initialized to max_num_seq '-1' before copying, marking illegal positions
+            self.share_inputs["batch_id_per_token"][:] = -1
+            self.share_inputs["batch_id_per_token"].copy_(batch_id_per_token, False)
+            self.share_inputs["cu_seqlens_q"].copy_(cu_seqlens_q, False)
+            self.share_inputs["cu_seqlens_k"].copy_(cu_seqlens_k, False)
 
         # For speculative decoding
         if self.speculative_decoding:
@@ -1461,7 +1485,8 @@ class GPUModelRunner(ModelRunnerBase):
         max_bad_tokens_len = max(self.share_inputs["bad_tokens_len"])
 
         # Initialize forward meta data
-        self.initialize_forward_meta(is_dummy_or_profile_run=is_dummy_or_profile_run)
+        with nvtx.range("initialize_forward_meta"):
+            self.initialize_forward_meta(is_dummy_or_profile_run=is_dummy_or_profile_run)
 
         # Get sampling metadata
         self.sampling_metadata = SamplingMetadata(
@@ -1524,7 +1549,8 @@ class GPUModelRunner(ModelRunnerBase):
         # Initialize forward meta
         routing_replay_table = None
         if self.routing_replay_manager is not None:
-            routing_replay_table = self.routing_replay_manager.get_routing_table()
+            with nvtx.range("get_routing_table"):
+                routing_replay_table = self.routing_replay_manager.get_routing_table()
         self.forward_meta = ForwardMeta(
             ids_remove_padding=self.share_inputs["ids_remove_padding"],
             rotary_embs=self.share_inputs["rope_emb"],
@@ -1554,7 +1580,8 @@ class GPUModelRunner(ModelRunnerBase):
             routing_replay_table=routing_replay_table,
         )
 
-        dist_status = self.collect_distributed_status()
+        with nvtx.range("collect_distributed_status"):
+            dist_status = self.collect_distributed_status()
 
         if_only_decode = dist_status.if_only_decode
         if self.fd_config.parallel_config.enable_chunked_moe:
@@ -1584,7 +1611,8 @@ class GPUModelRunner(ModelRunnerBase):
 
         # Initialzie attention meta data
         for attn_backend in self.attn_backends:
-            attn_backend.init_attention_metadata(self.forward_meta)
+            with nvtx.range("init_attention_metadata"):
+                attn_backend.init_attention_metadata(self.forward_meta)
 
         # for zero size
         self.forward_meta.is_zero_size = self.forward_meta.ids_remove_padding.shape[0] == 0
@@ -2333,30 +2361,36 @@ class GPUModelRunner(ModelRunnerBase):
             num_running_requests: batch_size
         """
         # 1. Prepare inputs of model and sampler.
-        p_done_idxs = self._get_p_done_idxs_gd(model_forward_batch, num_running_requests)
-
-        self._prepare_inputs()
-        self.sampler.pre_process(p_done_idxs)
+        with nvtx.range("_get_p_done_idxs_gd"):
+            p_done_idxs = self._get_p_done_idxs_gd(model_forward_batch, num_running_requests)
+        with nvtx.range("_prepare_inputs"):
+            self._prepare_inputs()
+        with nvtx.range("sampler_pre_process"):
+            self.sampler.pre_process(p_done_idxs)
 
         # 1.1 Update state of logits processor
-        for proc in self.sampling_metadata.logits_processors:
-            proc.update_state(self.share_inputs)
+        with nvtx.range("update_state"):
+            for proc in self.sampling_metadata.logits_processors:
+                proc.update_state(self.share_inputs)
 
         # 2. Padding inputs for cuda graph
-        self.padding_cudagraph_inputs()
+        with nvtx.range("padding_cudagraph_inputs"):
+            self.padding_cudagraph_inputs()
 
         # 3. Execute model
         if self.enable_mm:
-            model_output = self.model(
-                self.forward_meta.ids_remove_padding,
-                self.share_inputs["image_features"],
-                self.forward_meta,
-            )
+            with nvtx.range("exec_mm_model_forward"):
+                model_output = self.model(
+                    self.forward_meta.ids_remove_padding,
+                    self.share_inputs["image_features"],
+                    self.forward_meta,
+                )
         else:
-            model_output = self.model(
-                self.forward_meta.ids_remove_padding,
-                self.forward_meta,
-            )
+            with nvtx.range("exec_non_mm_model_forward"):
+                model_output = self.model(
+                    self.forward_meta.ids_remove_padding,
+                    self.forward_meta,
+                )
 
         # NOTE(wufeisheng): If `not_need_stop`` is False, it means the current worker is in an idle state.
         # This logic is not used in TP (Tensor Parallelism) mode. However, in EP (Expert Parallelism) mode,
@@ -2368,7 +2402,8 @@ class GPUModelRunner(ModelRunnerBase):
         if self.use_cudagraph:
             model_output = model_output[: self.real_token_num]
 
-        prompt_logprobs_list = self._get_prompt_logprobs_list(model_output)
+        with nvtx.range("_get_prompt_logprobs_list"):
+            prompt_logprobs_list = self._get_prompt_logprobs_list(model_output)
 
         if self.is_pooling_model:
             pooler_output = self._pool(model_output, num_running_requests)
@@ -2418,47 +2453,52 @@ class GPUModelRunner(ModelRunnerBase):
 
             return None
         else:
-            hidden_states = rebuild_padding(
-                model_output,
-                self.share_inputs["cu_seqlens_q"],
-                self.share_inputs["seq_lens_this_time"],
-                self.share_inputs["seq_lens_decoder"],
-                self.share_inputs["seq_lens_encoder"],
-                (self.share_inputs["output_padding_offset"] if self.speculative_decoding else None),
-                self.model_config.max_model_len,
-            )
+            with nvtx.range("rebuild_padding"):
+                hidden_states = rebuild_padding(
+                    model_output,
+                    self.share_inputs["cu_seqlens_q"],
+                    self.share_inputs["seq_lens_this_time"],
+                    self.share_inputs["seq_lens_decoder"],
+                    self.share_inputs["seq_lens_encoder"],
+                    (self.share_inputs["output_padding_offset"] if self.speculative_decoding else None),
+                    self.model_config.max_model_len,
+                )
 
             # 4. Compute logits, Sample
-            logits = self.model.compute_logits(hidden_states)
+            with nvtx.range("model_compute_logits"):
+                logits = self.model.compute_logits(hidden_states)
 
             if not self.speculative_decoding:
-                set_value_by_flags_and_idx(
-                    self.share_inputs["pre_ids"],
-                    self.share_inputs["input_ids"],
-                    self.share_inputs["seq_lens_this_time"],
-                    self.share_inputs["seq_lens_encoder"],
-                    self.share_inputs["seq_lens_decoder"],
-                    self.share_inputs["step_idx"],
-                    self.share_inputs["stop_flags"],
-                )
-                sampler_output = self.sampler(
-                    logits,
-                    self.sampling_metadata,
-                    p_done_idxs,
-                )
+                with nvtx.range("set_value_by_flags_and_idx"):
+                    set_value_by_flags_and_idx(
+                        self.share_inputs["pre_ids"],
+                        self.share_inputs["input_ids"],
+                        self.share_inputs["seq_lens_this_time"],
+                        self.share_inputs["seq_lens_encoder"],
+                        self.share_inputs["seq_lens_decoder"],
+                        self.share_inputs["step_idx"],
+                        self.share_inputs["stop_flags"],
+                    )
+                with nvtx.range("exec_sampler"):
+                    sampler_output = self.sampler(
+                        logits,
+                        self.sampling_metadata,
+                        p_done_idxs,
+                    )
 
                 if (
                     self.enable_logprob
                     and not envs.FD_USE_GET_SAVE_OUTPUT_V1
                     and sampler_output.logprobs_tensors is None
                 ):
-                    sampler_output.logprobs_tensors = LogprobsTensors(
-                        logprob_token_ids=sampler_output.sampled_token_ids,
-                        logprobs=paddle.empty_like(sampler_output.sampled_token_ids, device="cpu", dtype="float32"),
-                        selected_token_ranks=paddle.empty(
-                            [sampler_output.sampled_token_ids.shape[0]], device="cpu", dtype="int64"
-                        ),
-                    )
+                    with nvtx.range("init_LogprobsTensors"):
+                        sampler_output.logprobs_tensors = LogprobsTensors(
+                            logprob_token_ids=sampler_output.sampled_token_ids,
+                            logprobs=paddle.empty_like(sampler_output.sampled_token_ids, device="cpu", dtype="float32"),
+                            selected_token_ranks=paddle.empty(
+                                [sampler_output.sampled_token_ids.shape[0]], device="cpu", dtype="int64"
+                            ),
+                        )
                 if self.parallel_config.tensor_parallel_size > 1:
                     paddle.distributed.broadcast(
                         sampler_output.sampled_token_ids,
@@ -2531,22 +2571,24 @@ class GPUModelRunner(ModelRunnerBase):
             else:
                 skip_save_output = False
 
-            post_process(
-                sampler_or_pooler_output=sampler_output,
-                model_output=model_output_data,
-                share_inputs=self.share_inputs,
-                sampling_metadata=self.sampling_metadata,
-                block_size=self.cache_config.block_size,
-                save_each_rank=self.parallel_config.use_ep,
-                speculative_decoding=self.speculative_decoding,
-                skip_save_output=skip_save_output,
-                async_output_queue=self.async_output_queue,
-                think_end_id=self.model_config.think_end_id,
-                line_break_id=self.model_config.line_break_id,
-                enable_entropy=self.enable_entropy,
-            )
+            with nvtx.range("post_process"):
+                post_process(
+                    sampler_or_pooler_output=sampler_output,
+                    model_output=model_output_data,
+                    share_inputs=self.share_inputs,
+                    sampling_metadata=self.sampling_metadata,
+                    block_size=self.cache_config.block_size,
+                    save_each_rank=self.parallel_config.use_ep,
+                    speculative_decoding=self.speculative_decoding,
+                    skip_save_output=skip_save_output,
+                    async_output_queue=self.async_output_queue,
+                    think_end_id=self.model_config.think_end_id,
+                    line_break_id=self.model_config.line_break_id,
+                    enable_entropy=self.enable_entropy,
+                )
             if self.guided_backend is not None and sampler_output is not None:
-                self.sampler.post_process(sampler_output.sampled_token_ids)
+                with nvtx.range("sampler_post_process"):
+                    self.sampler.post_process(sampler_output.sampled_token_ids)
 
             # 6. Speculative decode
             if self.speculative_decoding:
@@ -2558,18 +2600,20 @@ class GPUModelRunner(ModelRunnerBase):
                     self.proposer.run(share_inputs=self.share_inputs)
 
             # 7. Update 'infer_seed' and step_cuda()
-            self.share_inputs["infer_seed"].add_(self.infer_seed_increment)
-            self.share_inputs["infer_seed"][:] %= self.MAX_INFER_SEED
+            with nvtx.range("update_infer_seed"):
+                self.share_inputs["infer_seed"].add_(self.infer_seed_increment)
+                self.share_inputs["infer_seed"][:] %= self.MAX_INFER_SEED
             if not envs.ENABLE_V1_KVCACHE_SCHEDULER:
-                step_cuda(
-                    self.share_inputs,
-                    self.cache_config.block_size,
-                    self.cache_config.enc_dec_block_num,
-                    self.speculative_config,
-                    self.cache_config.enable_prefix_caching,
-                )
-
-                self._update_chunked_prefill(model_forward_batch)
+                with nvtx.range("step_cuda"):
+                    step_cuda(
+                        self.share_inputs,
+                        self.cache_config.block_size,
+                        self.cache_config.enc_dec_block_num,
+                        self.speculative_config,
+                        self.cache_config.enable_prefix_caching,
+                    )
+                with nvtx.range("_update_chunked_prefill"):
+                    self._update_chunked_prefill(model_forward_batch)
             elif self.speculative_decoding:
                 speculate_schedule_cache(
                     self.share_inputs["draft_tokens"],
@@ -2593,13 +2637,14 @@ class GPUModelRunner(ModelRunnerBase):
 
         # Routing replay
         if self.fd_config.routing_replay_config.enable_routing_replay:
-            if (
-                not self.exist_prefill()
-                and not self.exist_decode()
-                and self.share_inputs["is_block_step"].sum() == 0
-                and self.share_inputs["is_chunk_step"].sum() == 0
-            ):
-                self.routing_replay_manager.put_table_to_store()
+            with nvtx.range("enable_routing_replay"):
+                if (
+                    not self.exist_prefill()
+                    and not self.exist_decode()
+                    and self.share_inputs["is_block_step"].sum() == 0
+                    and self.share_inputs["is_chunk_step"].sum() == 0
+                ):
+                    self.routing_replay_manager.put_table_to_store()
             return None
 
     def _pool(self, hidden_states: paddle.Tensor, num_running_requests: int) -> Optional[ModelRunnerOutput]:
@@ -2930,25 +2975,27 @@ class GPUModelRunner(ModelRunnerBase):
 
     def extract_vision_features_paddleocr(self, inputs: dict[str, list[paddle.Tensor]]) -> paddle.Tensor:
         if envs.FD_ENABLE_MAX_PREFILL:
-            inputs["vit_position_ids_lst"] = np.concatenate(inputs["vit_position_ids_lst"])
-            images = paddle.concat(inputs["images_lst"]).cast("bfloat16")
-            grid_thw = paddle.to_tensor(inputs["grid_thw_lst"], dtype="int64")
-            position_ids = paddle.to_tensor(inputs["vit_position_ids_lst"], dtype="int64")
-            cu_seqlens = paddle.cumsum(paddle.to_tensor(inputs["cu_seqlens"])).cast("int32")
+            with nvtx.range("ENABLE_FD_ENABLE_MAX_PREFILL"):
+                inputs["vit_position_ids_lst"] = np.concatenate(inputs["vit_position_ids_lst"])
+                images = paddle.concat(inputs["images_lst"]).cast("bfloat16")
+                grid_thw = paddle.to_tensor(inputs["grid_thw_lst"], dtype="int64")
+                position_ids = paddle.to_tensor(inputs["vit_position_ids_lst"], dtype="int64")
+                cu_seqlens = paddle.cumsum(paddle.to_tensor(inputs["cu_seqlens"])).cast("int32")
         else:
-            assert inputs["images"] is not None
-            grid_thw = inputs["grid_thw"]
-            images = inputs["images"]
+            with nvtx.range("DISABLE_FD_ENABLE_MAX_PREFILL"):
+                assert inputs["images"] is not None
+                grid_thw = inputs["grid_thw"]
+                images = inputs["images"]
 
-            position_ids = []
-            cu_seqlens = [0]
-            for idx, thw in enumerate(grid_thw):
-                numel = np.prod(np.array(thw))
-                position_ids.append(paddle.arange(numel) % np.prod(thw[1:]))
-                cu_seqlens.append(cu_seqlens[-1] + numel)
+                position_ids = []
+                cu_seqlens = [0]
+                for idx, thw in enumerate(grid_thw):
+                    numel = np.prod(np.array(thw))
+                    position_ids.append(paddle.arange(numel) % np.prod(thw[1:]))
+                    cu_seqlens.append(cu_seqlens[-1] + numel)
 
-            position_ids = paddle.concat(position_ids, axis=0).to(images.place)
-            cu_seqlens = paddle.to_tensor(cu_seqlens, dtype=paddle.int32).to(images.place)
+                position_ids = paddle.concat(position_ids, axis=0).to(images.place)
+                cu_seqlens = paddle.to_tensor(cu_seqlens, dtype=paddle.int32).to(images.place)
 
         with paddle.amp.auto_cast(
             True,
@@ -2957,17 +3004,20 @@ class GPUModelRunner(ModelRunnerBase):
             level="O2",
             dtype=self.model_config.dtype,
         ):
-            image_features = self.model.visual(
-                pixel_values=images,
-                image_grid_thw=grid_thw,
-                position_ids=position_ids,
-                interpolate_pos_encoding=True,
-                cu_seqlens=cu_seqlens,
-                use_rope=True,
-                window_size=-1,
-            )
-            image_features = self.model.projector(image_features, grid_thw)
-            image_features = paddle.concat(image_features, axis=0)
+            with nvtx.range("exec_visual"):
+                image_features = self.model.visual(
+                    pixel_values=images,
+                    image_grid_thw=grid_thw,
+                    position_ids=position_ids,
+                    interpolate_pos_encoding=True,
+                    cu_seqlens=cu_seqlens,
+                    use_rope=True,
+                    window_size=-1,
+                )
+            with nvtx.range("exec_projector"):
+                image_features = self.model.projector(image_features, grid_thw)
+            with nvtx.range("concat_image_features"):
+                image_features = paddle.concat(image_features, axis=0)
 
         return image_features
 

@@ -31,6 +31,7 @@ from fastdeploy.utils import get_logger, set_random_seed
 from fastdeploy.worker.model_runner_base import ModelRunnerBase
 from fastdeploy.worker.output import ModelRunnerOutput
 from fastdeploy.worker.worker_base import WorkerBase
+from torch.cuda import nvtx
 
 logger = get_logger("gpu_worker", "gpu_worker.log")
 
@@ -199,9 +200,11 @@ class GpuWorker(WorkerBase):
         and workers and modelrunners should not perceive it.
         """
         if envs.ENABLE_V1_KVCACHE_SCHEDULER:
-            self.model_runner.insert_tasks_v1(req_dicts=req_dicts, num_running_requests=num_running_requests)
+            with nvtx.range("insert_tasks_v1"):
+                self.model_runner.insert_tasks_v1(req_dicts=req_dicts, num_running_requests=num_running_requests)
         else:
-            self.model_runner.insert_prefill_inputs(req_dicts=req_dicts, num_running_requests=num_running_requests)
+            with nvtx.range("insert_prefill_inputs"):
+                self.model_runner.insert_prefill_inputs(req_dicts=req_dicts, num_running_requests=num_running_requests)
 
     def graph_optimize_and_warm_up_model(self) -> None:
         """

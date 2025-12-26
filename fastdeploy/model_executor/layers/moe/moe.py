@@ -40,6 +40,7 @@ try:
 except:
     logger.warning("import noaux_tc Failed!")
 import numpy as np
+from torch.cuda import nvtx
 
 
 def get_moe_method(layer=None):
@@ -643,17 +644,18 @@ class FusedMoE(nn.Layer):
         topk_ids_hookfunc = None
         if self.enable_routing_replay:
             if forward_meta is not None:  # forward_meta is None when execute empty_input_forward
-                topk_ids_hookfunc = partial(
-                    save_routing_to_buffer,
-                    routing_replay_table=forward_meta.routing_replay_table,
-                    batch_id_per_token=forward_meta.batch_id_per_token,
-                    seq_lens_decoder=forward_meta.seq_lens_decoder,
-                    cu_seqlens_q=forward_meta.cu_seqlens_q,
-                    layer_idx=self.layer_idx,
-                    tp_size=self.fd_config.parallel_config.tensor_parallel_size,
-                    ep_size=self.fd_config.parallel_config.expert_parallel_size,
-                    tp_group=self.fd_config.parallel_config.tp_group,
-                )
+                with nvtx.range("save_routing_to_buffer"):
+                    topk_ids_hookfunc = partial(
+                        save_routing_to_buffer,
+                        routing_replay_table=forward_meta.routing_replay_table,
+                        batch_id_per_token=forward_meta.batch_id_per_token,
+                        seq_lens_decoder=forward_meta.seq_lens_decoder,
+                        cu_seqlens_q=forward_meta.cu_seqlens_q,
+                        layer_idx=self.layer_idx,
+                        tp_size=self.fd_config.parallel_config.tensor_parallel_size,
+                        ep_size=self.fd_config.parallel_config.expert_parallel_size,
+                        tp_group=self.fd_config.parallel_config.tp_group,
+                    )
 
         token_num = x.shape[0]
         if (
@@ -662,22 +664,26 @@ class FusedMoE(nn.Layer):
             and (not self.fd_config.parallel_config.use_sequence_parallel_moe)
             and token_num >= self.attn_tp_size
         ):
-            out = self.forward_split_allgather(x, gate, topk_ids_hookfunc=topk_ids_hookfunc)
+            with nvtx.range("forward_split_allgather"):
+                out = self.forward_split_allgather(x, gate, topk_ids_hookfunc=topk_ids_hookfunc)
         elif self.fd_config.parallel_config.use_ep and self.fd_config.parallel_config.enable_chunked_moe:
-            out = self.forward_chunked_moe(
-                x,
-                gate,
-                forward_meta,
-                topk_ids_hookfunc=topk_ids_hookfunc,
-            )
+            with nvtx.range("forward_chunked_moe"):
+                out = self.forward_chunked_moe(
+                    x,
+                    gate,
+                    forward_meta,
+                    topk_ids_hookfunc=topk_ids_hookfunc,
+                )
         else:
-            out = self.forward_normal(x, gate, forward_meta, topk_ids_hookfunc=topk_ids_hookfunc)
+            with nvtx.range("forward_normal_fused_moe_cutlass_backend"):
+                out = self.forward_normal(x, gate, forward_meta, topk_ids_hookfunc=topk_ids_hookfunc)
 
         if self.reduce_results and self.tp_size > 1:
-            if current_platform.is_intel_hpu():
-                tensor_model_parallel_all_reduce_custom(out)
-            else:
-                out = tensor_model_parallel_all_reduce(out, self.tp_group)
+            with nvtx.range("reduce_results"):
+                if current_platform.is_intel_hpu():
+                    tensor_model_parallel_all_reduce_custom(out)
+                else:
+                    out = tensor_model_parallel_all_reduce(out, self.tp_group)
         return out
 
     def forward_chunked_moe(

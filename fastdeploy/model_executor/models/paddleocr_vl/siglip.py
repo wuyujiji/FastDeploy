@@ -27,6 +27,7 @@ from fastdeploy.model_executor.utils import h2d_copy, slice_fn
 
 from .config import PaddleOCRVisionConfig
 from .siglip_ops import get_activation_fn, neox_rope_embedding
+from torch.cuda import nvtx
 
 
 class SiglipAttention(nn.Layer):
@@ -124,22 +125,26 @@ class SiglipAttention(nn.Layer):
         sin_emb: Optional[paddle.Tensor] = None,  # (cos, sin)
     ):
         B, seq_length, D = hidden_states.shape
-        qkv = self.qkv_proj(hidden_states)
-        q, k, v = neox_rope_embedding(qkv, cos_emb, sin_emb, self.num_heads, self.head_dim)
-        attn_output = self.flash_attn_func(
-            q,
-            k,
-            v,
-            cu_seqlens,
-            cu_seqlens,
-            max_seqlen,
-            max_seqlen,
-            causal=False,
-            **self.flash_attn_kwargs,
-        )[0]
+        with nvtx.range("qkv_proj"):
+            qkv = self.qkv_proj(hidden_states)
+        with nvtx.range("neox_rope_embedding"):
+            q, k, v = neox_rope_embedding(qkv, cos_emb, sin_emb, self.num_heads, self.head_dim)
+        with nvtx.range("flash_attn_unpadded"):
+            attn_output = self.flash_attn_func(
+                q,
+                k,
+                v,
+                cu_seqlens,
+                cu_seqlens,
+                max_seqlen,
+                max_seqlen,
+                causal=False,
+                **self.flash_attn_kwargs,
+            )[0]
 
         attn_output = attn_output.reshape((seq_length, -1))
-        attn_output = self.out_proj(attn_output)
+        with nvtx.range("out_proj"):
+            attn_output = self.out_proj(attn_output)
         return attn_output
 
 
@@ -188,17 +193,20 @@ class SiglipVisionEmbeddings(nn.Layer):
             new_width = width // self.patch_size
 
         sqrt_num_positions = paddle.to_tensor(num_positions**0.5, dtype=paddle.int64)
-        patch_pos_embed = patch_pos_embed.reshape((1, sqrt_num_positions, sqrt_num_positions, dim))
-        patch_pos_embed = patch_pos_embed.transpose((0, 3, 1, 2))
+        with nvtx.range("patch_pos_embed_reshape"):
+            patch_pos_embed = patch_pos_embed.reshape((1, sqrt_num_positions, sqrt_num_positions, dim))
+        with nvtx.range("patch_pos_embed_transpose"):
+            patch_pos_embed = patch_pos_embed.transpose((0, 3, 1, 2))
 
-        patch_pos_embed = nn.functional.interpolate(
-            patch_pos_embed,
-            size=(new_height, new_width),
-            mode="bilinear",
-            align_corners=False,
-        )
-
-        patch_pos_embed = patch_pos_embed.transpose((0, 2, 3, 1)).reshape((1, -1, dim))
+        with nvtx.range("patch_pos_embed_interpolate"):
+            patch_pos_embed = nn.functional.interpolate(
+                patch_pos_embed,
+                size=(new_height, new_width),
+                mode="bilinear",
+                align_corners=False,
+            )
+        with nvtx.range("patch_pos_embed_final_transpose"):
+            patch_pos_embed = patch_pos_embed.transpose((0, 2, 3, 1)).reshape((1, -1, dim))
         return patch_pos_embed
 
     @staticmethod
@@ -242,36 +250,43 @@ class SiglipVisionEmbeddings(nn.Layer):
 
             batch_size, squence_len, channel, height, width = pixel_values.shape
             target_dtype = self.patch_embedding.weight.dtype
-            pixel_values = rearrange(pixel_values, "b l c h w -> (b l) c h w")
-            patch_embeds = self.patch_embedding(pixel_values.to(dtype=target_dtype))  # shape = [*, width, grid, grid]
-            embeddings = patch_embeds.flatten(-2).squeeze(-1)
-            embeddings = rearrange(embeddings, "(b l) d -> b l d", b=batch_size, l=squence_len)
+            with nvtx.range("rearrange_b_l_c_h_w"):
+                pixel_values = rearrange(pixel_values, "b l c h w -> (b l) c h w")
+            with nvtx.range("patch_embedding"):
+                patch_embeds = self.patch_embedding(pixel_values.to(dtype=target_dtype))  # shape = [*, width, grid, grid]
+            with nvtx.range("flatten_squeeze"):
+                embeddings = patch_embeds.flatten(-2).squeeze(-1)
+            with nvtx.range("rearrange_b_l_d"):
+                embeddings = rearrange(embeddings, "(b l) d -> b l d", b=batch_size, l=squence_len)
             # todo: not debug
             if interpolate_pos_encoding and image_grid_thw is not None:
-                flatten_image_grid_thw = self.flatten_list(image_grid_thw)
-                flatten_image_grid_thw = np.array(flatten_image_grid_thw)
-                assert batch_size == 1
-                start = 0
+                with nvtx.range("enter_if"):
+                    flatten_image_grid_thw = self.flatten_list(image_grid_thw)
+                    flatten_image_grid_thw = np.array(flatten_image_grid_thw)
+                    assert batch_size == 1
+                    start = 0
 
-                assert sum([np.prod(x) for x in flatten_image_grid_thw]) == embeddings.shape[1], (
-                    flatten_image_grid_thw,
-                    embeddings.shape,
-                )
-                embeddings = embeddings.squeeze(0)
-                tmp_embeddings = list()
-                for image_grid in image_grid_thw:
-                    t, h, w = image_grid
-                    end = start + t * h * w
-                    image_embeddings = embeddings[int(start) : int(end), :]
-                    position_embedding = (
-                        self.interpolate_pos_encoding(image_embeddings, h, w, True).squeeze(0).tile((t, 1))
-                    ).astype(image_embeddings.dtype)
-                    image_embeddings = image_embeddings + position_embedding
-                    tmp_embeddings.append(image_embeddings)
-                    start = end
-                embeddings = paddle.concat(tmp_embeddings, axis=0).unsqueeze(0)
+                    assert sum([np.prod(x) for x in flatten_image_grid_thw]) == embeddings.shape[1], (
+                        flatten_image_grid_thw,
+                        embeddings.shape,
+                    )
+                    embeddings = embeddings.squeeze(0)
+                    tmp_embeddings = list()
+                    for image_grid in image_grid_thw:
+                        t, h, w = image_grid
+                        end = start + t * h * w
+                        image_embeddings = embeddings[int(start) : int(end), :]
+                        with nvtx.range("interpolate_pos_encoding"):
+                            position_embedding = (
+                                self.interpolate_pos_encoding(image_embeddings, h, w, True).squeeze(0).tile((t, 1))
+                            ).astype(image_embeddings.dtype)
+                        image_embeddings = image_embeddings + position_embedding
+                        tmp_embeddings.append(image_embeddings)
+                        start = end
+                    embeddings = paddle.concat(tmp_embeddings, axis=0).unsqueeze(0)
             else:
-                embeddings = embeddings + self.packing_position_embedding(position_ids)
+                with nvtx.range("enter_else"):
+                    embeddings = embeddings + self.packing_position_embedding(position_ids)
             return embeddings
         else:
             raise NotImplementedError(str(pixel_values.shape))
@@ -302,9 +317,12 @@ class SiglipMLP(nn.Layer):
         h2d_copy(param, loaded_weight)
 
     def forward(self, hidden_states: paddle.Tensor) -> paddle.Tensor:
-        hidden_states = self.fc1(hidden_states)
-        hidden_states = get_activation_fn(self.config.hidden_act)(hidden_states[0])
-        hidden_states = self.fc2(hidden_states)
+        with nvtx.range("fc1"):
+            hidden_states = self.fc1(hidden_states)
+        with nvtx.range("activation"):
+            hidden_states = get_activation_fn(self.config.hidden_act)(hidden_states[0])
+        with nvtx.range("fc2"):
+            hidden_states = self.fc2(hidden_states)
         return hidden_states
 
 
@@ -330,24 +348,28 @@ class SiglipEncoderLayer(paddle.nn.Layer):
 
         residual = hidden_states
         ############################
-        ln1_out = self.layer_norm1(hidden_states)
+        with nvtx.range("layer_norm1"):
+            ln1_out = self.layer_norm1(hidden_states)
 
-        x = self.self_attn(
-            hidden_states=ln1_out,
-            attention_mask=attention_mask,
-            output_attentions=output_attentions,
-            cu_seqlens=cu_seqlens,
-            max_seqlen=max_seqlen,
-            cos_emb=cos_emb,
-            sin_emb=sin_emb,
-        )
+        with nvtx.range("SiglipAttention"):
+            x = self.self_attn(
+                hidden_states=ln1_out,
+                attention_mask=attention_mask,
+                output_attentions=output_attentions,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
+                cos_emb=cos_emb,
+                sin_emb=sin_emb,
+            )
 
         hs_post_attn = residual + x
 
         residual = hs_post_attn
-        ln2_out = self.layer_norm2(residual)
+        with nvtx.range("layer_norm2"):
+            ln2_out = self.layer_norm2(residual)
 
-        mlp_out = self.mlp(ln2_out)
+        with nvtx.range("SiglipMLP"):
+            mlp_out = self.mlp(ln2_out)
 
         hidden_states_out = residual + mlp_out
 
@@ -414,22 +436,28 @@ class SiglipEncoder(nn.Layer):
             pad_h = (-h) % window_size
             pad_w = (-w) % window_size
             assert pad_h >= 0 and pad_w >= 0, (pad_h, pad_w)
-            window_index = F.pad(window_index, (0, pad_w, 0, pad_h), value=pad_values)
-            window_index = rearrange(
-                window_index,
-                "t (h p1) (w p2) -> t (h w) (p1 p2)",
-                p1=window_size,
-                p2=window_size,
-            )
-            window_seqlens = (window_index != pad_values).long().sum(-1).reshape(-1)
+            with nvtx.range("pad_window_index"):
+                window_index = F.pad(window_index, (0, pad_w, 0, pad_h), value=pad_values)
+            with nvtx.range("rearrange_window_index"):
+                window_index = rearrange(
+                    window_index,
+                    "t (h p1) (w p2) -> t (h w) (p1 p2)",
+                    p1=window_size,
+                    p2=window_size,
+                )
+            with nvtx.range("long_sum_reshape"):
+                window_seqlens = (window_index != pad_values).long().sum(-1).reshape(-1)
             window_index = window_index.reshape(-1)
             window_index = window_index[window_index != pad_values]
             window_indices.append(window_index + start_window_index)
-            cu_seqlens_within_windows.append(window_seqlens.cumsum(0) + start_window_index)
+            with nvtx.range("cumsum"):
+                cu_seqlens_within_windows.append(window_seqlens.cumsum(0) + start_window_index)
             start_window_index += t * h * w
-        window_indices = paddle.concat(window_indices, axis=0)
-        cu_seqlens_within_windows = paddle.concat(cu_seqlens_within_windows, axis=0)
-        cu_seqlens_within_windows = F.pad(cu_seqlens_within_windows, (1, 0), value=0).astype("int32")
+        with nvtx.range("concat"):
+            window_indices = paddle.concat(window_indices, axis=0)
+            cu_seqlens_within_windows = paddle.concat(cu_seqlens_within_windows, axis=0)
+        with nvtx.range("pad_cu_seqlens_within_windows"):
+            cu_seqlens_within_windows = F.pad(cu_seqlens_within_windows, (1, 0), value=0).astype("int32")
         return window_indices, cu_seqlens_within_windows
 
     def forward(
@@ -460,63 +488,72 @@ class SiglipEncoder(nn.Layer):
         attention_mask = attention_mask.to(inputs_embeds.dtype) if attention_mask is not None else None
 
         if use_rope is True:
-            flatten_image_grid_thw = self.flatten_list(image_grid_thw)
-            flatten_image_grid_thw = np.array(flatten_image_grid_thw)
-            assert sum([np.prod(x) for x in flatten_image_grid_thw]) == hidden_states.shape[1], (
-                flatten_image_grid_thw,
-                hidden_states.shape,
-            )
-
-            if width_position_ids is None or height_position_ids is None:
-                split_hids = list()
-                split_wids = list()
-                for t, h, w in flatten_image_grid_thw:
-                    t, h, w = map(int, (t, h, w))
-                    image_pids = paddle.arange(t * h * w) % (h * w)
-                    sample_hids = image_pids // w
-                    sample_wids = image_pids % w
-                    split_hids.append(sample_hids)
-                    split_wids.append(sample_wids)
-                width_position_ids = paddle.concat(split_wids, axis=0)
-                height_position_ids = paddle.concat(split_hids, axis=0)
-
-            window_indices, cu_seqlens_within_windows = None, None
-
-            if use_window_attn:
-                window_indices, cu_seqlens_within_windows = self.build_window_index(
-                    flatten_image_grid_thw, window_size
-                )
-                reversed_window_indices = window_indices.argsort()
-                height_position_ids = height_position_ids[window_indices]
-                width_position_ids = width_position_ids[window_indices]
-
-            pids = paddle.stack([height_position_ids, width_position_ids], axis=-1).astype(paddle.int64)
-            max_grid_size = pids.max() + 1
-            rope_emb_max_grid = self.rotary_pos_emb(max_grid_size)
-
-            rope_emb = rope_emb_max_grid[pids].flatten(1)
-            rope_emb = rope_emb.tile((1, 2))
-            cos_emb = rope_emb.cos().astype("float32")
-            sin_emb = rope_emb.sin().astype("float32")
-            cos_emb = cos_emb.unsqueeze(-2)
-            sin_emb = sin_emb.unsqueeze(-2)
-        else:
-            cos_emb = None
-            sin_emb = None
-
-            window_indices, cu_seqlens_within_windows = None, None
-
-            if use_window_attn:
+            with nvtx.range("use_rope"):
                 flatten_image_grid_thw = self.flatten_list(image_grid_thw)
-                assert (
-                    sum([np.prod(x.astype("float32").cpu().numpy()) for x in flatten_image_grid_thw])
-                    == hidden_states.shape[1]
-                ), (flatten_image_grid_thw, hidden_states.shape)
-
-                window_indices, cu_seqlens_within_windows = self.build_window_index(
-                    flatten_image_grid_thw, window_size
+                flatten_image_grid_thw = np.array(flatten_image_grid_thw)
+                assert sum([np.prod(x) for x in flatten_image_grid_thw]) == hidden_states.shape[1], (
+                    flatten_image_grid_thw,
+                    hidden_states.shape,
                 )
-                reversed_window_indices = window_indices.argsort()
+
+                if width_position_ids is None or height_position_ids is None:
+                    split_hids = list()
+                    split_wids = list()
+                    for t, h, w in flatten_image_grid_thw:
+                        t, h, w = map(int, (t, h, w))
+                        image_pids = paddle.arange(t * h * w) % (h * w)
+                        sample_hids = image_pids // w
+                        sample_wids = image_pids % w
+                        split_hids.append(sample_hids)
+                        split_wids.append(sample_wids)
+                    width_position_ids = paddle.concat(split_wids, axis=0)
+                    height_position_ids = paddle.concat(split_hids, axis=0)
+
+                window_indices, cu_seqlens_within_windows = None, None
+
+                if use_window_attn:
+                    with nvtx.range("build_window_index"):
+                        window_indices, cu_seqlens_within_windows = self.build_window_index(
+                            flatten_image_grid_thw, window_size
+                        )
+                    with nvtx.range("argsort"):
+                        reversed_window_indices = window_indices.argsort()
+                    height_position_ids = height_position_ids[window_indices]
+                    width_position_ids = width_position_ids[window_indices]
+
+                with nvtx.range("stack"):
+                    pids = paddle.stack([height_position_ids, width_position_ids], axis=-1).astype(paddle.int64)
+                max_grid_size = pids.max() + 1
+                with nvtx.range("SigLIPRotaryEmbedding"):
+                    rope_emb_max_grid = self.rotary_pos_emb(max_grid_size)
+
+                rope_emb = rope_emb_max_grid[pids].flatten(1)
+                rope_emb = rope_emb.tile((1, 2))
+                cos_emb = rope_emb.cos().astype("float32")
+                sin_emb = rope_emb.sin().astype("float32")
+                cos_emb = cos_emb.unsqueeze(-2)
+                sin_emb = sin_emb.unsqueeze(-2)
+        else:
+            with nvtx.range("not_use_rope"):
+                cos_emb = None
+                sin_emb = None
+
+                window_indices, cu_seqlens_within_windows = None, None
+
+                if use_window_attn:
+                    flatten_image_grid_thw = self.flatten_list(image_grid_thw)
+                    with nvtx.range("x_d2h"):
+                        assert (
+                            sum([np.prod(x.astype("float32").cpu().numpy()) for x in flatten_image_grid_thw])
+                            == hidden_states.shape[1]
+                        ), (flatten_image_grid_thw, hidden_states.shape)
+
+                    with nvtx.range("build_window_index"):
+                        window_indices, cu_seqlens_within_windows = self.build_window_index(
+                            flatten_image_grid_thw, window_size
+                        )
+                    with nvtx.range("argsort"):
+                        reversed_window_indices = window_indices.argsort()
 
         if use_window_attn:
             assert cu_seqlens_within_windows is not None
@@ -556,31 +593,31 @@ class SiglipEncoder(nn.Layer):
         sin_emb: Optional[paddle.Tensor],
     ) -> paddle.Tensor:
         max_seqlen = (attn_cu_seqlens[1:] - attn_cu_seqlens[:-1]).max().cpu()
+        with nvtx.range("_run_encoder_layer"):
+            for encoder_layer in self.layers:
+                if output_hidden_states:
+                    encoder_states = encoder_states + (
+                        (hidden_states[:, reversed_window_indices, :],) if use_window_attn else (hidden_states,)
+                    )
+                with nvtx.range("_run_each_encoder_layer"):
+                    layer_outputs = encoder_layer(
+                        hidden_states=hidden_states,
+                        attention_mask=attention_mask,
+                        output_attentions=output_attentions,
+                        cu_seqlens=attn_cu_seqlens,
+                        max_seqlen=max_seqlen,
+                        cos_emb=cos_emb,
+                        sin_emb=sin_emb,
+                    )
+                hidden_states = layer_outputs[0]
 
-        for encoder_layer in self.layers:
+                if output_attentions:
+                    all_attentions = all_attentions + (layer_outputs[1],)
+
+            if use_window_attn:
+                hidden_states = hidden_states[:, reversed_window_indices, :]
             if output_hidden_states:
-                encoder_states = encoder_states + (
-                    (hidden_states[:, reversed_window_indices, :],) if use_window_attn else (hidden_states,)
-                )
-
-            layer_outputs = encoder_layer(
-                hidden_states=hidden_states,
-                attention_mask=attention_mask,
-                output_attentions=output_attentions,
-                cu_seqlens=attn_cu_seqlens,
-                max_seqlen=max_seqlen,
-                cos_emb=cos_emb,
-                sin_emb=sin_emb,
-            )
-            hidden_states = layer_outputs[0]
-
-            if output_attentions:
-                all_attentions = all_attentions + (layer_outputs[1],)
-
-        if use_window_attn:
-            hidden_states = hidden_states[:, reversed_window_indices, :]
-        if output_hidden_states:
-            encoder_states = encoder_states + (hidden_states,)
+                encoder_states = encoder_states + (hidden_states,)
 
         return hidden_states
 
@@ -645,26 +682,29 @@ class SiglipVisionTransformer(nn.Layer):
         use_rope: Optional[bool] = False,
         window_size: Optional[bool] = -1,
     ):
-        hidden_states = self.embeddings(
-            pixel_values,
-            interpolate_pos_encoding=interpolate_pos_encoding,
-            position_ids=position_ids,
-            image_grid_thw=image_grid_thw,
-        )
-        last_hidden_state = self.encoder(
-            inputs_embeds=hidden_states,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            attention_mask=attention_mask,
-            cu_seqlens=cu_seqlens,
-            image_grid_thw=image_grid_thw,
-            use_rope=use_rope,
-            height_position_ids=height_position_ids,
-            width_position_ids=width_position_ids,
-            window_size=window_size,
-            vision_or_text="vision",
-        )
-        last_hidden_state = self.post_layernorm(last_hidden_state)
+        with nvtx.range("embeddings"):
+            hidden_states = self.embeddings(
+                pixel_values,
+                interpolate_pos_encoding=interpolate_pos_encoding,
+                position_ids=position_ids,
+                image_grid_thw=image_grid_thw,
+            )
+        with nvtx.range("encoder"):
+            last_hidden_state = self.encoder(
+                inputs_embeds=hidden_states,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                attention_mask=attention_mask,
+                cu_seqlens=cu_seqlens,
+                image_grid_thw=image_grid_thw,
+                use_rope=use_rope,
+                height_position_ids=height_position_ids,
+                width_position_ids=width_position_ids,
+                window_size=window_size,
+                vision_or_text="vision",
+            )
+        with nvtx.range("post_layernorm"):
+            last_hidden_state = self.post_layernorm(last_hidden_state)
 
         sample_hidden_state = list()
         assert cu_seqlens is not None

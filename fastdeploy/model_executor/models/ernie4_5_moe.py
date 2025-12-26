@@ -55,6 +55,7 @@ from fastdeploy.model_executor.models.utils import LayerIdPlaceholder as layerid
 from fastdeploy.model_executor.models.utils import WeightMeta
 from fastdeploy.platforms import current_platform
 from fastdeploy.worker.experts_manager import RedundantExpertManger
+from torch.cuda import nvtx
 
 
 class Ernie4_5_MLP(nn.Layer):
@@ -95,9 +96,12 @@ class Ernie4_5_MLP(nn.Layer):
         self.down_proj.load_state_dict(state_dict)
 
     def forward(self, hidden_states: paddle.Tensor, forward_meta: ForwardMeta = None):
-        gate_up_out = self.up_gate_proj(hidden_states)
-        act_out = self.act_fn(gate_up_out)
-        down_out = self.down_proj(act_out)
+        with nvtx.range("up_gate_proj"):
+            gate_up_out = self.up_gate_proj(hidden_states)
+        with nvtx.range("act_fn"):
+            act_out = self.act_fn(gate_up_out)
+        with nvtx.range("down_proj"):
+            down_out = self.down_proj(act_out)
         return down_out
 
 
@@ -218,14 +222,16 @@ class Ernie4_5_MoE(nn.Layer):
         hidden_states: paddle.Tensor,
         forward_meta: ForwardMeta,
     ):
-        out = self.experts(
-            x=hidden_states,
-            gate=self.gate,
-            forward_meta=forward_meta,
-        )
+        with nvtx.range("experts_FusedMoE"):
+            out = self.experts(
+                x=hidden_states,
+                gate=self.gate,
+                forward_meta=forward_meta,
+            )
         if self.num_shared_experts > 0:
-            s_x = self.shared_experts(hidden_states)
-            out = out + s_x
+            with nvtx.range("shared_experts_Ernie4_5_MLP"):
+                s_x = self.shared_experts(hidden_states)
+                out = out + s_x
         return out
 
 
@@ -262,14 +268,17 @@ class Ernie4_5_Attention(nn.Layer):
         forward_meta: ForwardMeta,
         hidden_states: paddle.Tensor,
     ):
-        qkv_out = self.qkv_proj(hidden_states)
+        with nvtx.range("qkv_proj"):
+            qkv_out = self.qkv_proj(hidden_states)
 
-        attn_out = self.attn(
-            qkv=qkv_out,
-            forward_meta=forward_meta,
-        )
+        with nvtx.range("ixinfer_attn"):
+            attn_out = self.attn(
+                qkv=qkv_out,
+                forward_meta=forward_meta,
+            )
 
-        output = self.o_proj(attn_out)
+        with nvtx.range("o_proj"):
+            output = self.o_proj(attn_out)
 
         return output
 
@@ -338,24 +347,25 @@ class Ernie4_5_DecoderLayer(nn.Layer):
         hidden_states: paddle.Tensor,
         residual: paddle.Tensor = None,
     ):
-        hidden_states, residual = self.input_layernorm(
-            hidden_states, residual_input=residual, forward_meta=forward_meta
-        )
-
-        hidden_states = self.self_attn(
-            hidden_states=hidden_states,
-            forward_meta=forward_meta,
-        )
-
-        hidden_states, residual = self.post_attention_layernorm(
-            hidden_states,
-            residual,
-        )
-
-        hidden_states = self.mlp(
-            hidden_states=hidden_states,
-            forward_meta=forward_meta,
-        )
+        with nvtx.range("input_rmsnorm"):
+            hidden_states, residual = self.input_layernorm(
+                hidden_states, residual_input=residual, forward_meta=forward_meta
+            )
+        with nvtx.range("Ernie4_5_Attention"):
+            hidden_states = self.self_attn(
+                hidden_states=hidden_states,
+                forward_meta=forward_meta,
+            )
+        with nvtx.range("post_rmsnorm"):
+            hidden_states, residual = self.post_attention_layernorm(
+                hidden_states,
+                residual,
+            )
+        with nvtx.range("mlp"):
+            hidden_states = self.mlp(
+                hidden_states=hidden_states,
+                forward_meta=forward_meta,
+            )
 
         return hidden_states, residual
 

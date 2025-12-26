@@ -33,6 +33,7 @@ from .utils import (
     pad_vocab_size,
     vocab_range_from_global_vocab_size,
 )
+from torch.cuda import nvtx
 
 
 @dataclass
@@ -305,16 +306,22 @@ class VocabParallelEmbedding(nn.Layer):
         if forward_meta is not None and forward_meta.is_zero_size:
             return paddle.empty([0, self.embedding_dim], dtype=self.embeddings.weight.dtype)
         if self.column_cut:
-            input_embedings = self.embeddings(ids_remove_padding)
-            inputs_embeds_temp = []
-            paddle.distributed.all_gather(
-                inputs_embeds_temp,
-                input_embedings,
-                group=self.tp_group,
-                sync_op=True,
-            )
-            input_embedings = paddle.concat(inputs_embeds_temp, -1)
+            with nvtx.range("column_cut"):
+                with nvtx.range("nn_mbedding"):
+                    input_embedings = self.embeddings(ids_remove_padding)
+                inputs_embeds_temp = []
+                with nvtx.range("all_gather"):
+                    paddle.distributed.all_gather(
+                        inputs_embeds_temp,
+                        input_embedings,
+                        group=self.tp_group,
+                        sync_op=True,
+                    )
+                with nvtx.range("concat"):
+                    input_embedings = paddle.concat(inputs_embeds_temp, -1)
         else:
-            input_embedings = self.embeddings(ids_remove_padding)
+            with nvtx.range("not_column_cut"):
+                with nvtx.range("fleet_meta_parallel_VocabParallelEmbedding"):
+                    input_embedings = self.embeddings(ids_remove_padding)
 
         return input_embedings

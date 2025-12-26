@@ -62,6 +62,7 @@ from fastdeploy.platforms import current_platform
 from fastdeploy.scheduler import SchedulerConfig
 from fastdeploy.utils import get_logger, optional_type
 from fastdeploy.worker.worker_base import WorkerBase
+from torch.cuda import nvtx
 
 logger = get_logger("worker_process", "worker_process.log")
 
@@ -416,99 +417,109 @@ class PaddleDisWorkerProc:
         self.model_weights_signal = np.zeros([1], dtype=np.int32)
         while True:
             # run eplb
-            self._run_eplb(tp_rank)
+            with nvtx.range("run_once_event_loop_normal"):
+                with nvtx.range("_run_eplb"):
+                    self._run_eplb(tp_rank)
 
-            if self.fd_config.load_config.dynamic_load_weight:
-                if self.model_weights_status.value[0] != ModelWeightsStatus.NORMAL:
-                    self.model_weights_signal[0] = int(self.model_weights_status.value[0])
-                if self.ranks > 1:
-                    self.model_weights_signal[0] = self._broadcast_model_weights_signal(src=0, group=None)
+                if self.fd_config.load_config.dynamic_load_weight:
+                    if self.model_weights_status.value[0] != ModelWeightsStatus.NORMAL:
+                        self.model_weights_signal[0] = int(self.model_weights_status.value[0])
+                    if self.ranks > 1:
+                        self.model_weights_signal[0] = self._broadcast_model_weights_signal(src=0, group=None)
 
-            req_dicts = None
-            self.worker_healthy_live_signal.value[tp_rank % self.max_chips_per_node] = int(time.time())
+                req_dicts = None
+                self.worker_healthy_live_signal.value[tp_rank % self.max_chips_per_node] = int(time.time())
 
-            # The first worker detects whether there are tasks in the task queue
-            if tp_rank == 0:
-                if self.task_queue.exist_tasks():
-                    if envs.ENABLE_V1_KVCACHE_SCHEDULER or not (
-                        self.fd_config.model_config.enable_mm and self.worker.exist_prefill()
-                    ):
-                        if self.nnode > 1:
-                            self.task_queue.read_finish_flag.set(1)
-                        else:
-                            self.exist_task_signal.value[0] = ExistTaskStatus.EXIST
+                # The first worker detects whether there are tasks in the task queue
+                if tp_rank == 0:
+                    if self.task_queue.exist_tasks():
+                        if envs.ENABLE_V1_KVCACHE_SCHEDULER or not (
+                            self.fd_config.model_config.enable_mm and self.worker.exist_prefill()
+                        ):
+                            if self.nnode > 1:
+                                self.task_queue.read_finish_flag.set(1)
+                            else:
+                                self.exist_task_signal.value[0] = ExistTaskStatus.EXIST
 
-            # Synchronize the signal set by tp_rank0 visiable to other workers
-            self._tp_barrier_wait() if tp_size > 1 else None
-
-            if self.fd_config.load_config.dynamic_load_weight:
-                if self.ranks > 1:
-                    paddle.distributed.barrier()
-                if self.model_weights_signal[0] != ModelWeightsStatus.NORMAL:
-                    logger.info(
-                        f"Rank: {self.local_rank} to update or clear parameters, signal is {self.model_weights_signal[0]}, [-1:clear, 1:update]"
-                    )
-                    from fastdeploy.rl.dynamic_weight_manager import (
-                        DynamicWeightManager,
-                    )
-
-                    self.model_weights_status.value[0] = self.model_weights_signal[0]
-                    DynamicWeightManager.check_model_weights_status(
-                        self.model_weights_status,
-                        # model_weights_signal
-                        self.worker.model_runner,
-                        self.parallel_config.local_engine_worker_queue_port,
-                        self.parallel_config.shutdown_comm_group_if_worker_idle,
-                    )
-                    logger.info(f"current task queue data: {self.task_queue.num_tasks()}")
-                    self.task_queue.clear_data()
-                    self.model_weights_signal[0] = ModelWeightsStatus.NORMAL
-                    logger.info(f"Rank: {self.local_rank} has updated or cleared parameters.")
-
-                    # 只有不关闭通信组时，清理权重后需要额外等待（否则信号量会同步混乱）
-                    if not self.fd_config.parallel_config.shutdown_comm_group_if_worker_idle:
-                        while self.model_weights_status.value[0] == ModelWeightsStatus.CLEARED:
-                            time.sleep(0.01)
-                        continue
-
-            if self.exist_task_signal.value[0] == ExistTaskStatus.EXIST or self.task_queue.read_finish_flag.get() == 1:
-                logger.info(f"Rank: {self.local_rank} Detected new requests.")
-
-                tasks, read_finish = self.task_queue.get_tasks()
-                # Only one of all tp_size client will get read_finish == True.
-                if read_finish:
-                    # Reset the two signal.
-                    if self.nnode > 1:
-                        self.task_queue.read_finish_flag.set(0)
-                    else:
-                        self.exist_task_signal.value[0] = ExistTaskStatus.EMPTY
-
-                req_dicts = []
-                for req_dict, bsz in tasks:
-                    num_running_requests = int(bsz)
-                    req_dicts.extend(req_dict)
-
-                req_ids = [req.request_id for req in req_dicts]
-                logger.info(
-                    f"Rank: {self.local_rank}, num_running_requests: {num_running_requests}, "
-                    f"num_insert_requests: {len(req_dicts)}, req_ids: {req_ids}"
-                )
-
-                # Process prefill inputs
-                self.worker.preprocess_new_task(req_dicts, num_running_requests)
-
-            if (not self.parallel_config.use_ep) and (not self.worker.model_runner.not_need_stop()):
+                # Synchronize the signal set by tp_rank0 visiable to other workers
                 self._tp_barrier_wait() if tp_size > 1 else None
 
-                time.sleep(0.001)
-                continue
+                if self.fd_config.load_config.dynamic_load_weight:
+                    if self.ranks > 1:
+                        paddle.distributed.barrier()
+                    with nvtx.range("dynamic_load_weight"):
+                        if self.model_weights_signal[0] != ModelWeightsStatus.NORMAL:
+                            logger.info(
+                                f"Rank: {self.local_rank} to update or clear parameters, signal is {self.model_weights_signal[0]}, [-1:clear, 1:update]"
+                            )
+                            from fastdeploy.rl.dynamic_weight_manager import (
+                                DynamicWeightManager,
+                            )
 
-            # Execute model to generate token. The generated token will be written to the buffer.
-            # These generated tokens can be obtained through get_output op.
-            start_execute_time = time.time()
-            self.worker.execute_model(req_dicts, num_running_requests)
-            self.exist_prefill_task_signal.value[0] = self.worker.exist_prefill()
-            logger.debug(f"execute model cost: {time.time()-start_execute_time:.5f} s")
+                            self.model_weights_status.value[0] = self.model_weights_signal[0]
+                            with nvtx.range("check_model_weights_status"):
+                                DynamicWeightManager.check_model_weights_status(
+                                    self.model_weights_status,
+                                    # model_weights_signal
+                                    self.worker.model_runner,
+                                    self.parallel_config.local_engine_worker_queue_port,
+                                    self.parallel_config.shutdown_comm_group_if_worker_idle,
+                                )
+                            logger.info(f"current task queue data: {self.task_queue.num_tasks()}")
+                            with nvtx.range("task_queue_clear_data"):
+                                self.task_queue.clear_data()
+                            self.model_weights_signal[0] = ModelWeightsStatus.NORMAL
+                            logger.info(f"Rank: {self.local_rank} has updated or cleared parameters.")
+
+                            # 只有不关闭通信组时，清理权重后需要额外等待（否则信号量会同步混乱）
+                            if not self.fd_config.parallel_config.shutdown_comm_group_if_worker_idle:
+                                while self.model_weights_status.value[0] == ModelWeightsStatus.CLEARED:
+                                    time.sleep(0.01)
+                                continue
+
+                if self.exist_task_signal.value[0] == ExistTaskStatus.EXIST or self.task_queue.read_finish_flag.get() == 1:
+                    logger.info(f"Rank: {self.local_rank} Detected new requests.")
+
+                    with nvtx.range("detect_new_requests"):
+                        with nvtx.range("get_tasks"):
+                            tasks, read_finish = self.task_queue.get_tasks()
+                        # Only one of all tp_size client will get read_finish == True.
+                        if read_finish:
+                            # Reset the two signal.
+                            if self.nnode > 1:
+                                self.task_queue.read_finish_flag.set(0)
+                            else:
+                                self.exist_task_signal.value[0] = ExistTaskStatus.EMPTY
+
+                        req_dicts = []
+                        for req_dict, bsz in tasks:
+                            num_running_requests = int(bsz)
+                            req_dicts.extend(req_dict)
+
+                        req_ids = [req.request_id for req in req_dicts]
+                        logger.info(
+                            f"Rank: {self.local_rank}, num_running_requests: {num_running_requests}, "
+                            f"num_insert_requests: {len(req_dicts)}, req_ids: {req_ids}"
+                        )
+
+                        # Process prefill inputs
+                        with nvtx.range("preprocess_new_task"):
+                            self.worker.preprocess_new_task(req_dicts, num_running_requests)
+
+                if (not self.parallel_config.use_ep) and (not self.worker.model_runner.not_need_stop()):
+                    self._tp_barrier_wait() if tp_size > 1 else None
+
+                    time.sleep(0.001)
+                    continue
+
+                # Execute model to generate token. The generated token will be written to the buffer.
+                # These generated tokens can be obtained through get_output op.
+                start_execute_time = time.time()
+                with nvtx.range("execute_model"):
+                    self.worker.execute_model(req_dicts, num_running_requests)
+                with nvtx.range("exist_prefill"):
+                    self.exist_prefill_task_signal.value[0] = self.worker.exist_prefill()
+                logger.debug(f"execute model cost: {time.time()-start_execute_time:.5f} s")
 
     def initialize_kv_cache(self) -> None:
         """Profiles the peak memory usage of the model to determine how many

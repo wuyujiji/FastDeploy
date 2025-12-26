@@ -44,6 +44,7 @@ from fastdeploy.platforms import current_platform
 
 from .projector import Projector
 from .siglip import SiglipVisionModel
+from torch.cuda import nvtx
 
 
 @support_graph_optimization
@@ -104,16 +105,20 @@ class PaddleOCRVLModel(nn.Layer):
         hidden_states = input_embeddings
 
         if current_platform.is_iluvatar() and forward_meta.attn_backend.mixed:
-            hidden_states = forward_meta.attn_backend.transpose(hidden_states)
+            with nvtx.range("transpose_hidden_states"):
+                hidden_states = forward_meta.attn_backend.transpose(hidden_states)
 
         residual = None
         for i in range(self.num_layers):
-            hidden_states, residual = self.layers[i](forward_meta, hidden_states, residual)
+            with nvtx.range("Ernie4_5_DecoderLayer"):
+                hidden_states, residual = self.layers[i](forward_meta, hidden_states, residual)
 
-        out = self.norm(hidden_states, residual)[0]
+        with nvtx.range("rmsnorm"):
+            out = self.norm(hidden_states, residual)[0]
 
         if current_platform.is_iluvatar() and forward_meta.attn_backend.mixed:
-            out = forward_meta.attn_backend.reverse_transpose(out)
+            with nvtx.range("reverse_transpose_hidden_states"):
+                out = forward_meta.attn_backend.reverse_transpose(out)
 
         return out
 
@@ -222,7 +227,8 @@ class PaddleOCRVLForConditionalGeneration(ModelForCasualLM):
         return "PaddleOCRVLForConditionalGeneration"
 
     def compute_logits(self, hidden_states: paddle.Tensor):
-        logits = self.lm_head(hidden_states)
+        with nvtx.range("lm_head_ParallelLMHead"):
+            logits = self.lm_head(hidden_states)
         logits = paddle.cast(logits, paddle.float32)
         logits[:, self.vocab_size :] = -float("inf")
 
@@ -234,9 +240,10 @@ class PaddleOCRVLForConditionalGeneration(ModelForCasualLM):
         image_features: Optional[paddle.Tensor] = None,
         forward_meta=None,
     ) -> paddle.Tensor:
-        input_embeddings = self.model.get_input_embeddings(
-            ids_remove_padding=ids_remove_padding, forward_meta=forward_meta
-        )
+        with nvtx.range("VocabParallelEmbedding"):
+            input_embeddings = self.model.get_input_embeddings(
+                ids_remove_padding=ids_remove_padding, forward_meta=forward_meta
+            )
         image_mask = ids_remove_padding == self.model.config.image_token_id
         image_token_num = image_mask.sum()
 
@@ -250,17 +257,19 @@ class PaddleOCRVLForConditionalGeneration(ModelForCasualLM):
         image_features: Optional[paddle.Tensor],
         forward_meta: ForwardMeta,
     ):
-        input_embeddings = self.get_input_embeddings(
-            ids_remove_padding=ids_remove_padding, image_features=image_features, forward_meta=forward_meta
-        )
+        with nvtx.range("get_input_embeddings"):
+            input_embeddings = self.get_input_embeddings(
+                ids_remove_padding=ids_remove_padding, image_features=image_features, forward_meta=forward_meta
+            )
 
         if forward_meta.step_use_cudagraph:
             self._decoder_input_embeddings.copy_(input_embeddings, False)
             input_embeddings = self._decoder_input_embeddings
 
-        hidden_states = self.model(
-            input_embeddings=input_embeddings,
-            forward_meta=forward_meta,
-        )
+        with nvtx.range("PaddleOCRVLModel_forward"):
+            hidden_states = self.model(
+                input_embeddings=input_embeddings,
+                forward_meta=forward_meta,
+            )
 
         return hidden_states

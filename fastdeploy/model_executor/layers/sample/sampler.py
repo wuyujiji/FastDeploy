@@ -42,6 +42,7 @@ from fastdeploy.model_executor.layers.sample.ops import (
 from fastdeploy.platforms import current_platform
 from fastdeploy.reasoning import ReasoningParser
 from fastdeploy.worker.output import LogprobsTensors, SamplerOutput
+from torch.cuda import nvtx
 
 
 def top_p_normalize_probs_paddle(
@@ -176,34 +177,39 @@ class GuidedDecoding:
 
     def update_vocab_mask(self, prefill_done_idxs: List[int] = []):
         """update vocab mask. (cpu-heavy operation)"""
-        for idx in prefill_done_idxs:
-            if self.logits_processors[idx] is None:
-                continue
+        with nvtx.range("update_vocab_mask"):
+            for idx in prefill_done_idxs:
+                if self.logits_processors[idx] is None:
+                    continue
 
-            assert not self._prefill_done_idxs[idx]
-            self._prefill_done_idxs[idx] = True
-            if isinstance(self.logits_processors[idx], Future):
-                continue
+                assert not self._prefill_done_idxs[idx]
+                self._prefill_done_idxs[idx] = True
+                if isinstance(self.logits_processors[idx], Future):
+                    continue
 
-        idxs = []
-        for idx, processor in enumerate(self.logits_processors):
-            if processor is None or not self._prefill_done_idxs[idx]:
-                continue
-            # skip, join at apply_token_mask
-            if isinstance(processor, Future):
-                continue
-            if processor.is_terminated:
-                self.reset_processor(idx)
-                continue
+            idxs = []
+            for idx, processor in enumerate(self.logits_processors):
+                if processor is None or not self._prefill_done_idxs[idx]:
+                    continue
+                # skip, join at apply_token_mask
+                if isinstance(processor, Future):
+                    continue
+                if processor.is_terminated:
+                    with nvtx.range("reset_processor"):
+                        self.reset_processor(idx)
+                    continue
 
-            self.accept_tokens_from_prefill_node(idx)
+                with nvtx.range("accept_tokens_from_prefill_node"):
+                    self.accept_tokens_from_prefill_node(idx)
 
-            if self.token_bitmask is None:
-                self.token_bitmask = self.logits_processors[idx].allocate_token_bitmask()
-
-            if self.should_fill_bitmask(idx):
-                idxs.append(idx)
-        self._async_batch_fill_token_bitmask(idxs)
+                if self.token_bitmask is None:
+                    with nvtx.range("allocate_token_bitmask"):
+                        self.token_bitmask = self.logits_processors[idx].allocate_token_bitmask()
+                with nvtx.range("should_fill_bitmask"):
+                    if self.should_fill_bitmask(idx):
+                        idxs.append(idx)
+            with nvtx.range("_async_batch_fill_token_bitmask"):
+                self._async_batch_fill_token_bitmask(idxs)
 
     def batch_fill_token_bitmask(self, batch: List[int]):
         """
@@ -397,7 +403,8 @@ class Sampler(nn.Layer):
     ) -> paddle.Tensor:
         """ """
         if sampling_metadata is None:
-            return F.log_softmax(logits, axis=-1)
+            with nvtx.range("returned_log_softmax"):
+                return F.log_softmax(logits, axis=-1)
         last_logits = logits
         real_bsz = last_logits.shape[0]
         temp_scaled_logprobs = sampling_metadata.temp_scaled_logprobs
@@ -409,7 +416,8 @@ class Sampler(nn.Layer):
             temp_temperature = paddle.where(real_bsz_temp_scaled, temperature, paddle.ones_like(temperature))
             last_logits = last_logits / temp_temperature
 
-        last_logprobs = F.log_softmax(last_logits, axis=-1)
+        with nvtx.range("last_logits_log_softmax"):
+            last_logprobs = F.log_softmax(last_logits, axis=-1)
         top_p_logprob = None
         top_p_req_mask = None
 
@@ -423,17 +431,22 @@ class Sampler(nn.Layer):
             seq_lens_decoder = share_inputs["seq_lens_decoder"].reshape([-1, 1])[:real_bsz]
             seq_lens_time_sum = seq_lens_this_time + seq_lens_encoder + seq_lens_decoder
             real_req_mask = seq_lens_time_sum > 0
-            top_p_req_mask = paddle.logical_and(top_p_normalized_logprobs[:real_bsz], real_req_mask)
-            real_req_top_p = sampling_metadata.top_p[:real_bsz]
-            # Normalize logprobs if top_p normalization is enabled
-            # NOTE: only normalize logprobs when top_p is set and not equal to 1.0
-            top_p_req_mask = paddle.logical_and(top_p_req_mask, real_req_top_p != 1.0)
+            with nvtx.range("logical_and"):
+                top_p_req_mask = paddle.logical_and(top_p_normalized_logprobs[:real_bsz], real_req_mask)
+                real_req_top_p = sampling_metadata.top_p[:real_bsz]
+                # Normalize logprobs if top_p normalization is enabled
+                # NOTE: only normalize logprobs when top_p is set and not equal to 1.0
+                top_p_req_mask = paddle.logical_and(top_p_req_mask, real_req_top_p != 1.0)
             if top_p_req_mask.any():
-                probs = F.softmax(last_logits, axis=-1)
-                probs = top_p_normalize_probs_paddle(probs, real_req_top_p)
-                top_p_logprob = paddle.log(probs)
+                with nvtx.range("softmax"):
+                    probs = F.softmax(last_logits, axis=-1)
+                with nvtx.range("top_p_normalize_probs_paddle"):
+                    probs = top_p_normalize_probs_paddle(probs, real_req_top_p)
+                with nvtx.range("paddle_log"):
+                    top_p_logprob = paddle.log(probs)
         if top_p_logprob is not None:
-            last_logprobs = paddle.where(top_p_req_mask, top_p_logprob, last_logprobs)
+            with nvtx.range("paddle_where"):
+                last_logprobs = paddle.where(top_p_req_mask, top_p_logprob, last_logprobs)
         return last_logprobs
 
     def gather_logprobs(
@@ -458,27 +471,34 @@ class Sampler(nn.Layer):
           Top-k float logprobs tensor, (num tokens) x (num_logprobs + 1)
           Sampled token rank tensor, (num tokens)
         """
-        assert token_ids.dtype == paddle.int64
-        logprobs.clip_(min=paddle.finfo(logprobs.dtype).min)
-        # Get with the logprob of the prompt or sampled token.
-        if len(token_ids.shape) < len(logprobs.shape):
-            token_ids = token_ids.unsqueeze(-1)
-        token_logprobs = paddle.take_along_axis(logprobs, token_ids, axis=-1)
+        with nvtx.range("gather_logprobs"):
+            assert token_ids.dtype == paddle.int64
+            with nvtx.range("clip_finfo"):
+                logprobs.clip_(min=paddle.finfo(logprobs.dtype).min)
+            # Get with the logprob of the prompt or sampled token.
+            if len(token_ids.shape) < len(logprobs.shape):
+                token_ids = token_ids.unsqueeze(-1)
+            with nvtx.range("take_along_axis"):
+                token_logprobs = paddle.take_along_axis(logprobs, token_ids, axis=-1)
 
-        # Compute the ranks of the actual token.
-        token_ranks = (logprobs >= token_logprobs).sum(-1)
+            # Compute the ranks of the actual token.
+            with nvtx.range("sum"):
+                token_ranks = (logprobs >= token_logprobs).sum(-1)
 
-        if num_logprobs >= 1:
-            # Find the topK values.
-            topk_logprobs, topk_indices = paddle.topk(logprobs, num_logprobs, axis=-1)
-            indices = paddle.concat([token_ids, topk_indices], axis=1)
-            top_logprobs = paddle.concat([token_logprobs, topk_logprobs], axis=1)
-        else:
-            indices = token_ids
-            top_logprobs = token_logprobs
-        indices = indices.cpu()
-        top_logprobs = top_logprobs.cpu()
-        token_ranks = token_ranks.cpu()
+            if num_logprobs >= 1:
+                # Find the topK values.
+                with nvtx.range("topk"):
+                    topk_logprobs, topk_indices = paddle.topk(logprobs, num_logprobs, axis=-1)
+                with nvtx.range("concat"):
+                    indices = paddle.concat([token_ids, topk_indices], axis=1)
+                    top_logprobs = paddle.concat([token_logprobs, topk_logprobs], axis=1)
+            else:
+                indices = token_ids
+                top_logprobs = token_logprobs
+            with nvtx.range("d2h"):
+                indices = indices.cpu()
+                top_logprobs = top_logprobs.cpu()
+                token_ranks = token_ranks.cpu()
         return LogprobsTensors(indices, top_logprobs, token_ranks)
 
     def forward_cuda(
@@ -488,49 +508,57 @@ class Sampler(nn.Layer):
         p_done_idxs: List[int] = [],
     ) -> SamplerOutput:
         """ """
-        logits = self.guided_decoding.apply_token_mask(logits, p_done_idxs)
+        with nvtx.range("apply_token_mask"):
+            logits = self.guided_decoding.apply_token_mask(logits, p_done_idxs)
 
         num_logprobs = sampling_metadata.max_num_logprobs
         if num_logprobs is not None:
             if self.logprobs_mode == "raw_logprobs":
-                raw_logprobs = self.compute_logprobs(logits, sampling_metadata)
+                with nvtx.range("compute_logprobs_1"):
+                    raw_logprobs = self.compute_logprobs(logits, sampling_metadata)
             elif self.logprobs_mode == "raw_logits":
                 raw_logprobs = logits.clone()
 
         for proc in sampling_metadata.logits_processors or []:
-            logits = proc.apply(logits)
+            with nvtx.range("logits_processors_apply"):
+                logits = proc.apply(logits)
 
-        logits = apply_penalty_multi_scores(
-            sampling_metadata.pre_token_ids,
-            sampling_metadata.prompt_ids,
-            sampling_metadata.prompt_lens,
-            logits,
-            sampling_metadata.repetition_penalties,
-            sampling_metadata.frequency_penalties,
-            sampling_metadata.presence_penalties,
-            sampling_metadata.temperature,
-            sampling_metadata.bad_words_token_ids,
-            sampling_metadata.step_idx,
-            sampling_metadata.min_dec_lens,
-            sampling_metadata.eos_token_ids,
-        )
+        with nvtx.range("apply_penalty_multi_scores"):
+            logits = apply_penalty_multi_scores(
+                sampling_metadata.pre_token_ids,
+                sampling_metadata.prompt_ids,
+                sampling_metadata.prompt_lens,
+                logits,
+                sampling_metadata.repetition_penalties,
+                sampling_metadata.frequency_penalties,
+                sampling_metadata.presence_penalties,
+                sampling_metadata.temperature,
+                sampling_metadata.bad_words_token_ids,
+                sampling_metadata.step_idx,
+                sampling_metadata.min_dec_lens,
+                sampling_metadata.eos_token_ids,
+            )
 
         if num_logprobs is not None:
             if self.logprobs_mode == "processed_logprobs":
-                raw_logprobs = self.compute_logprobs(logits, sampling_metadata)
+                with nvtx.range("compute_logprobs_2"):
+                    raw_logprobs = self.compute_logprobs(logits, sampling_metadata)
             elif self.logprobs_mode == "processed_logits":
                 raw_logprobs = logits.clone()
 
-        probs = F.softmax(logits)
+        with nvtx.range("softmax"):
+            probs = F.softmax(logits)
 
-        probs = min_p_sampling(probs, sampling_metadata.min_p, sampling_metadata.min_p_list)
-        _, next_tokens = top_k_top_p_sampling(
-            probs,
-            sampling_metadata.top_p,
-            sampling_metadata.top_k,
-            sampling_metadata.top_k_list,
-            topp_seed=sampling_metadata.seed,
-        )
+        with nvtx.range("min_p_sampling"):
+            probs = min_p_sampling(probs, sampling_metadata.min_p, sampling_metadata.min_p_list)
+        with nvtx.range("top_k_top_p_sampling"):
+            _, next_tokens = top_k_top_p_sampling(
+                probs,
+                sampling_metadata.top_p,
+                sampling_metadata.top_k,
+                sampling_metadata.top_k_list,
+                topp_seed=sampling_metadata.seed,
+            )
 
         logprobs_tensors = (
             None if num_logprobs is None else self.gather_logprobs(raw_logprobs, num_logprobs, token_ids=next_tokens)
@@ -538,7 +566,8 @@ class Sampler(nn.Layer):
         if sampling_metadata.enable_early_stop:
             # will set the stop batch in stop_flags
             assert sampling_metadata.stop_flags is not None, "need stop_flags for early stop"
-            self.early_stopper.process(probs, next_tokens, sampling_metadata.stop_flags)
+            with nvtx.range("early_stopper_process"):
+                self.early_stopper.process(probs, next_tokens, sampling_metadata.stop_flags)
 
         sampler_output = SamplerOutput(
             # The sampled tokens are expanded to 2D tensor with shape

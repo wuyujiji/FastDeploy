@@ -21,6 +21,7 @@ import paddle
 import paddle.nn as nn
 
 from fastdeploy.model_executor.utils import h2d_copy
+from torch.cuda import nvtx
 
 
 class GELUActivation(nn.Layer):
@@ -66,35 +67,45 @@ class Projector(nn.Layer):
     def forward(self, image_features, image_grid_thw):
         m1, m2 = self.merge_kernel_size
         if isinstance(image_features, (list, tuple)):
-            processed_features = list()
-            for image_feature, image_grid in zip(image_features, image_grid_thw):
-                image_feature = self.pre_norm(image_feature)  # shape: (T*H*W, D)
-                t, h, w = image_grid
-                from einops import rearrange
+            with nvtx.range("image_features_tuple"):
+                processed_features = list()
+                for image_feature, image_grid in zip(image_features, image_grid_thw):
+                    with nvtx.range("pre_layer_norm"):
+                        image_feature = self.pre_norm(image_feature)  # shape: (T*H*W, D)
+                    t, h, w = image_grid
+                    from einops import rearrange
 
-                image_feature = rearrange(
-                    image_feature,
-                    "(t h p1 w p2) d -> (t h w) (p1 p2 d)",
-                    t=int(t),
-                    h=int(h // m1),
-                    p1=int(m1),
-                    w=int(w // m2),
-                    p2=int(m2),
-                )
-                hidden_states = self.linear_1(image_feature)
-                hidden_states = self.act(hidden_states)
-                hidden_states = self.linear_2(hidden_states)
-                processed_features.append(hidden_states)
+                    with nvtx.range("rearrange"):
+                        image_feature = rearrange(
+                            image_feature,
+                            "(t h p1 w p2) d -> (t h w) (p1 p2 d)",
+                            t=int(t),
+                            h=int(h // m1),
+                            p1=int(m1),
+                            w=int(w // m2),
+                            p2=int(m2),
+                        )
+                    with nvtx.range("linear_1"):
+                        hidden_states = self.linear_1(image_feature)
+                    with nvtx.range("actication"):
+                        hidden_states = self.act(hidden_states)
+                    with nvtx.range("linear_2"):
+                        hidden_states = self.linear_2(hidden_states)
+                    processed_features.append(hidden_states)
 
             return processed_features
-
-        dim = image_features.shape[-1]
-        image_features = paddle.reshape(image_features, [-1, dim])
-        hidden_states = self.pre_norm(image_features)
-        hidden_states = paddle.reshape(hidden_states, [-1, self.hidden_size])
-        hidden_states = self.linear_1(hidden_states)
-        hidden_states = self.act(hidden_states)
-        hidden_states = self.linear_2(hidden_states)
+        with nvtx.range("image_features_not_tuple"):
+            dim = image_features.shape[-1]
+            image_features = paddle.reshape(image_features, [-1, dim])
+            with nvtx.range("pre_layer_norm"):
+                hidden_states = self.pre_norm(image_features)
+            hidden_states = paddle.reshape(hidden_states, [-1, self.hidden_size])
+            with nvtx.range("linear_1"):
+                hidden_states = self.linear_1(hidden_states)
+            with nvtx.range("actication"):
+                hidden_states = self.act(hidden_states)
+            with nvtx.range("linear_2"):
+                hidden_states = self.linear_2(hidden_states)
         return hidden_states
 
     def weight_loader(self, param, loaded_weight, loaded_shard_id: Optional[str] = None):

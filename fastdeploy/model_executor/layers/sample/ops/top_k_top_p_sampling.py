@@ -20,6 +20,7 @@ import paddle
 
 from fastdeploy import envs
 from fastdeploy.platforms import current_platform
+from torch.cuda import nvtx
 
 if current_platform.is_gcu():
     from fastdeploy.model_executor.ops.gcu import top_p_sampling as gcu_top_p_sampling
@@ -142,28 +143,33 @@ def rejection_top_p_sampling(
             )
 
         if top_k_list and not any(x > 0 for x in top_k_list):
-            ids = rejection_top_p_sampling(
-                x,
-                top_p,
-                None,
-                seed,
-            )
-        else:
-            if order == "top_k_first":
-                renorm_probs = top_k_renorm_probs(x, top_k)
+            with nvtx.range("top_k_list_rejection_top_p_sampling"):
                 ids = rejection_top_p_sampling(
-                    renorm_probs,
+                    x,
                     top_p,
                     None,
                     seed,
                 )
+        else:
+            if order == "top_k_first":
+                with nvtx.range("top_k_first"):
+                    with nvtx.range("top_k_renorm_probs"):
+                        renorm_probs = top_k_renorm_probs(x, top_k)
+                    with nvtx.range("rejection_top_p_sampling"):
+                        ids = rejection_top_p_sampling(
+                            renorm_probs,
+                            top_p,
+                            None,
+                            seed,
+                        )
             else:
-                ids = rejection_top_p_sampling(
-                    x,
-                    top_p,
-                    top_k,
-                    seed,
-                )
+                with nvtx.range("not_top_k_first_rejection_top_p_sampling"):
+                    ids = rejection_top_p_sampling(
+                        x,
+                        top_p,
+                        top_k,
+                        seed,
+                    )
     except ImportError:
         raise RuntimeError("Cannot import rejection_top_p_sampling op.")
     return ids
@@ -185,8 +191,10 @@ def min_p_sampling(
 
             probs = min_p_sampling(probs, min_p_arr)
         else:
-            max_probabilities = paddle.amax(probs, axis=-1, keepdim=True)
+            with nvtx.range("amax"):
+                max_probabilities = paddle.amax(probs, axis=-1, keepdim=True)
             adjusted_min_p = max_probabilities * min_p_arr
             invalid_token_mask = probs < adjusted_min_p.reshape([-1, 1])
-            probs = paddle.where(invalid_token_mask, paddle.full_like(probs, 0.0), probs)
+            with nvtx.range("where"):
+                probs = paddle.where(invalid_token_mask, paddle.full_like(probs, 0.0), probs)
         return probs

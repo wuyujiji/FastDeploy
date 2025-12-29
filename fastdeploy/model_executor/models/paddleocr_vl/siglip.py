@@ -63,7 +63,8 @@ class SiglipAttention(nn.Layer):
             self.flash_attn_func = flash_attention_v3_varlen
             self.flash_attn_kwargs = {}
         else:
-            from paddle.nn.functional.flash_attention import flash_attn_unpadded
+            # from paddle.nn.functional.flash_attention import flash_attn_unpadded
+            from fastdeploy.model_executor.ops.iluvatar import flash_attn_unpadded
 
             self.flash_attn_func = flash_attn_unpadded
             self.flash_attn_kwargs = {"scale": self.scale, "training": False}
@@ -136,7 +137,8 @@ class SiglipAttention(nn.Layer):
             max_seqlen,
             causal=False,
             **self.flash_attn_kwargs,
-        )[0]
+        )
+        #)[0]
 
         attn_output = attn_output.reshape((seq_length, -1))
         attn_output = self.out_proj(attn_output)

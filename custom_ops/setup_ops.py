@@ -560,6 +560,7 @@ elif paddle.is_compiled_with_custom_device("iluvatar_gpu"):
                 "gpu_ops/update_inputs_v1.cu",
                 "gpu_ops/get_img_boundaries.cc",
                 "gpu_ops/fused_neox_rope_embedding.cu",
+                "gpu_ops/get_output_ep.cc",
                 "iluvatar_ops/moe_dispatch.cu",
                 "iluvatar_ops/moe_reduce.cu",
                 "iluvatar_ops/flash_attn_unpadded.cu",

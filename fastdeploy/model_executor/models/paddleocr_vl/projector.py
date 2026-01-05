@@ -44,6 +44,7 @@ class GELUActivation(nn.Layer):
     def forward(self, input):
         return self.act(input)
 
+from fastdeploy.model_executor.ops.iluvatar.quant_gemm import siglip_mlp
 
 class Projector(nn.Layer):
 
@@ -92,9 +93,10 @@ class Projector(nn.Layer):
         image_features = paddle.reshape(image_features, [-1, dim])
         hidden_states = self.pre_norm(image_features)
         hidden_states = paddle.reshape(hidden_states, [-1, self.hidden_size])
-        hidden_states = self.linear_1(hidden_states)
-        hidden_states = self.act(hidden_states)
-        hidden_states = self.linear_2(hidden_states)
+        # hidden_states = self.linear_1(hidden_states)
+        # hidden_states = self.act(hidden_states)
+        # hidden_states = self.linear_2(hidden_states)
+        hidden_states = siglip_mlp(hidden_states, self.linear_1.weight, self.linear_1.bias, self.linear_2.weight, self.linear_2.bias, act_type="gelu")
         return hidden_states
 
     def weight_loader(self, param, loaded_weight, loaded_shard_id: Optional[str] = None):

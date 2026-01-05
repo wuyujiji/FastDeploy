@@ -278,7 +278,7 @@ class SiglipVisionEmbeddings(nn.Layer):
         else:
             raise NotImplementedError(str(pixel_values.shape))
 
-
+from fastdeploy.model_executor.ops.iluvatar.quant_gemm import siglip_mlp
 class SiglipMLP(nn.Layer):
     def __init__(self, config):
         super().__init__()
@@ -304,9 +304,10 @@ class SiglipMLP(nn.Layer):
         h2d_copy(param, loaded_weight)
 
     def forward(self, hidden_states: paddle.Tensor) -> paddle.Tensor:
-        hidden_states = self.fc1(hidden_states)
-        hidden_states = get_activation_fn(self.config.hidden_act)(hidden_states[0])
-        hidden_states = self.fc2(hidden_states)
+        # hidden_states = self.fc1(hidden_states)
+        # hidden_states = get_activation_fn(self.config.hidden_act)(hidden_states[0])
+        # hidden_states = self.fc2(hidden_states)
+        hidden_states = siglip_mlp(hidden_states, self.fc1.weight, self.fc1.bias, self.fc2.weight, self.fc2.bias, act_type="gelu")
         return hidden_states
 
 

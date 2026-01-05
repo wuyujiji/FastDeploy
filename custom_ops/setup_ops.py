@@ -569,6 +569,7 @@ elif paddle.is_compiled_with_custom_device("iluvatar_gpu"):
                 "iluvatar_ops/mixed_fused_attn.cu",
                 "iluvatar_ops/w8a16_group_gemm.cu",
                 "iluvatar_ops/quant_gemm.cu",
+                "iluvatar_ops/gemm.cu",
                 "iluvatar_ops/runtime/iluvatar_context.cc",
             ],
             include_dirs=["iluvatar_ops/runtime", "gpu_ops"],

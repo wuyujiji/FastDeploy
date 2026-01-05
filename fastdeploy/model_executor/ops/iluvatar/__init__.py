@@ -25,3 +25,4 @@ from .paged_attention import (  # noqa: F401
     paged_attention,
     prefill_fused_paged_attention,
 )
+from .quant_gemm import weight_only_linear

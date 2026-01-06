@@ -22,7 +22,8 @@ std::vector<paddle::Tensor> WeightOnlyGemm(
     const paddle::optional<paddle::Tensor>& bias,
     const std::string& weight_dtype,
     const std::string& format,
-    const int group_size) {
+    const int group_size,
+    const std::string& act_type) {
   auto dev_ctx = static_cast<const phi::CustomContext*>(
       paddle::experimental::DeviceContextPool::Instance().Get(x.place()));
   auto stream = static_cast<const cudaStream_t>(dev_ctx->stream());
@@ -35,8 +36,8 @@ std::vector<paddle::Tensor> WeightOnlyGemm(
   // format="NN": [k, n]
   // format="TN": [n, k]
   PD_CHECK(w_dims.size() == 2, "weight should be 2D");
-  // [1, n]
-  PD_CHECK(ws_dims.size() == 2, "weight_scale should be 2D");
+  // [1, n] or [n]
+  PD_CHECK(ws_dims.size() <= 2, "weight_scale should be 1D or 2D");
   if (bias) {
      // [n]
      PD_CHECK(bias.get().dims().size() == 1, "weight should be 1D");
@@ -72,8 +73,12 @@ std::vector<paddle::Tensor> WeightOnlyGemm(
   int ldb = k;
   int ldc = n;
 
-  PD_CHECK(ws_dims[0] == 1);
-  PD_CHECK(ws_dims[1] == n);
+  if (ws_dims.size() == 1) {
+    PD_CHECK(ws_dims[0] == n);
+  } else if (
+    PD_CHECK(ws_dims[0] == 1);
+    PD_CHECK(ws_dims[1] == n);
+  )
   
   auto output = GetEmptyTensor({m, n}, x.dtype(), x.place());
 
@@ -88,8 +93,6 @@ std::vector<paddle::Tensor> WeightOnlyGemm(
   cudaDataType_t Atype;
   if (weight_dtype == "int8") {
     Atype = CUDA_R_8I;
-  } else if (weight_dtype == "int4") {
-    Atype = CUDA_R_4I;
   } else {
     common::errors::InvalidArgument(
         "WeightOnlyGemm support int4 and int8 quant method now");
@@ -105,7 +108,24 @@ std::vector<paddle::Tensor> WeightOnlyGemm(
   Ctype = Btype;
   cudaDataType_t computeType = CUDA_R_32F;
   cudaDataType_t scaleType = CUDA_R_32F;
-  cuinferGEMMCustomOption_t customOption = CUINFER_BLAS_GEMM_CUSTOM_NONE;
+  cuinferGEMMCustomOption_t customOption;
+  if (bias) {
+    if (act_type == "gelu") {
+        customOption = CUINFER_BLAS_GEMM_CUSTOM_HALFBIAS_GELU;
+    } else if (act_type == "relu") {
+        customOption = CUINFER_BLAS_GEMM_CUSTOM_HALFBIAS_RELU;
+    } else if (act_type == "silu") {
+        customOption = CUINFER_BLAS_GEMM_CUSTOM_HALFBIAS_SILU;
+    } else {
+        customOption = CUINFER_BLAS_GEMM_CUSTOM_HALFBIAS;
+    }
+} else {
+    // default CUINFER_BLAS_GEMM_CUSTOM_NONE
+    customOption = CUINFER_BLAS_GEMM_CUSTOM_NONE;
+    if (act_type == "silu") {
+        customOption = CUINFER_BLAS_GEMM_CUSTOM_SILU;
+    }
+}
 
   cuinferQuantGEMMHostParam cust_host_param;
   cust_host_param.size = sizeof(cuinferQuantGEMMHostParam);
@@ -120,31 +140,33 @@ std::vector<paddle::Tensor> WeightOnlyGemm(
   float alpha = 1.f;
   int batch_count = 1;
 
-  size_t workspace_size = 0;
-  CUINFER_CHECK(cuinferGetCustomGemmWorkspace(transa,
-                                              transb,
-                                              n,
-                                              m,
-                                              k,
-                                              Atype,
-                                              lda,
-                                              0, // lda
-                                              Btype,
-                                              ldb,
-                                              0, // ldb,
-                                              Ctype,
-                                              ldc,
-                                              0, // ldc
-                                              batch_count,
-                                              computeType,
-                                              scaleType,
-                                              &workspace_size));
+  if (k % 64 != 0) {
+    size_t workspace_size = 0;
+    CUINFER_CHECK(cuinferGetCustomGemmWorkspace(transa,
+                                                transb,
+                                                n,
+                                                m,
+                                                k,
+                                                Atype,
+                                                lda,
+                                                0, // stride_a
+                                                Btype,
+                                                ldb,
+                                                0, // stride_b
+                                                Ctype,
+                                                ldc,
+                                                0, // stride_c
+                                                batch_count,
+                                                computeType,
+                                                scaleType,
+                                                &workspace_size));
 
-  auto* allocator = paddle::GetAllocator(x.place());
-  phi::Allocator::AllocationPtr tmp_workspace;
-  if (workspace_size > 0) {
-      tmp_workspace = allocator->Allocate(workspace_size);
-      cust_device_param.workspace = tmp_workspace->ptr();
+    auto* allocator = paddle::GetAllocator(x.place());
+    phi::Allocator::AllocationPtr tmp_workspace;
+    if (workspace_size > 0) {
+        tmp_workspace = allocator->Allocate(workspace_size);
+        cust_device_param.workspace = tmp_workspace->ptr();
+    }
   }
 
   CUINFER_CHECK(cuinferCustomGemm(handle,
@@ -159,16 +181,16 @@ std::vector<paddle::Tensor> WeightOnlyGemm(
                                   weight_data,
                                   Atype,
                                   lda,
-                                  0, // lda
+                                  0, // stride_a
                                   x_data,
                                   Btype,
                                   ldb,
-                                  0, // ldb
+                                  0, // stride_b
                                   &beta,
                                   out_data,
                                   Ctype,
                                   ldc,
-                                  0, // ldc
+                                  0, // stride_c
                                   batch_count,
                                   computeType,
                                   scaleType,
@@ -210,7 +232,10 @@ PD_BUILD_STATIC_OP(weight_only_gemm)
              "weight_scale",
              paddle::Optional("bias")})
     .Outputs({"output"})
-    .Attrs({"weight_dtype:std::string", "format:std::string", "group_size:int"})
+    .Attrs({"weight_dtype:std::string",
+            "format:std::string",
+            "group_size:int",
+            "act_type:std::string"})
     .SetKernelFn(PD_KERNEL(WeightOnlyGemm))
     .SetInferShapeFn(PD_INFER_SHAPE(WeightOnlyGemmInferShape))
     .SetInferDtypeFn(PD_INFER_DTYPE(WeightOnlyGemmInferDtype));

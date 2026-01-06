@@ -19,7 +19,7 @@ std::vector<paddle::Tensor> Gemm(
     const paddle::Tensor& x,
     const paddle::Tensor& weight,
     const paddle::optional<paddle::Tensor>& bias,
-    const string& act_type) {
+    const std::string& act_type) {
   auto dev_ctx = static_cast<const phi::CustomContext*>(
       paddle::experimental::DeviceContextPool::Instance().Get(x.place()));
   auto stream = static_cast<const cudaStream_t>(dev_ctx->stream());

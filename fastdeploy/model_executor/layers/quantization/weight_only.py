@@ -41,7 +41,8 @@ if current_platform.is_xpu():
         weight_only_linear_xpu as weight_only_linear,
     )
 if current_platform.is_iluvatar():
-    from fastdeploy.model_executor.ops.iluvatar import weight_only_linear
+    #from fastdeploy.model_executor.ops.iluvatar import weight_only_linear
+    from paddle.nn.quant import weight_only_linear
 else:
     from paddle.nn.quant import weight_only_linear
 

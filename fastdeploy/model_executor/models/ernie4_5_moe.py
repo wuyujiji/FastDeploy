@@ -55,6 +55,7 @@ from fastdeploy.model_executor.models.utils import LayerIdPlaceholder as layerid
 from fastdeploy.model_executor.models.utils import WeightMeta
 from fastdeploy.platforms import current_platform
 from fastdeploy.worker.experts_manager import RedundantExpertManger
+from fastdeploy.model_executor.ops.iluvatar.quant_gemm import ernie_mlp
 
 
 class Ernie4_5_MLP(nn.Layer):
@@ -95,9 +96,19 @@ class Ernie4_5_MLP(nn.Layer):
         self.down_proj.load_state_dict(state_dict)
 
     def forward(self, hidden_states: paddle.Tensor, forward_meta: ForwardMeta = None):
-        gate_up_out = self.up_gate_proj(hidden_states)
-        act_out = self.act_fn(gate_up_out)
-        down_out = self.down_proj(act_out)
+        # gate_up_out = self.up_gate_proj(hidden_states)
+        # act_out = self.act_fn(gate_up_out)
+        # down_out = self.down_proj(act_out)
+        down_out = ernie_mlp(
+            hidden_states,
+            self.up_gate_proj.weight,
+            self.up_gate_proj.weight_scale,
+            self.up_gate_proj.bias,
+            self.down_proj.weight,
+            self.down_proj.weight_scale,
+            self.down_proj.bias,
+            act_type="silu")
+        
         return down_out
 
 

@@ -15,18 +15,14 @@
 #include "helper.h"
 #include "iluvatar_context.h"
 
-std::vector<paddle::Tensor> PrefillFusedPagedAttn(
+std::vector<paddle::Tensor> PrefillFusedPagedAttnNoUpdateCache(
   const paddle::Tensor& qkv,
-  paddle::Tensor& k_cache,
-  paddle::Tensor& v_cache,
-  const paddle::Tensor& block_table,
   const paddle::Tensor& cu_seqlens_qkv,
   const paddle::Tensor& rope_sin,
   const paddle::Tensor& rope_cos,
   int num_heads,
   int head_dim,
   int num_kv_heads,
-  int block_size,
   int max_seq_len,
   float scale,
   bool causal,
@@ -46,23 +42,6 @@ std::vector<paddle::Tensor> PrefillFusedPagedAttn(
     common::errors::InvalidArgument(
         "paged_attention support half and bfloat16 now");
   }
-
-  PADDLE_ENFORCE_EQ(k_cache.dtype(),
-                    dtype,
-                    common::errors::InvalidArgument(
-                        "k_cache dtype must be the same as query dtype"));
-  PADDLE_ENFORCE_EQ(k_cache.is_contiguous(),
-                    true,
-                    common::errors::InvalidArgument(
-                        "paged_attention expects k_cache is contiguous"));
-  PADDLE_ENFORCE_EQ(
-      block_table.dtype(),
-      paddle::DataType::INT32,
-      common::errors::InvalidArgument("block_table dtype must be int32"));
-  PADDLE_ENFORCE_EQ(block_table.is_contiguous(),
-                    true,
-                    common::errors::InvalidArgument(
-                        "paged_attention expects block_table is contiguous"));
   PADDLE_ENFORCE_EQ(
       cu_seqlens_qkv.dtype(),
       paddle::DataType::INT32,
@@ -72,13 +51,6 @@ std::vector<paddle::Tensor> PrefillFusedPagedAttn(
       true,
       common::errors::InvalidArgument(
           "paged_attention expects cu_seqlens_qkv is contiguous"));
-  // check dim and shape
-  // k_cache: [num_blocks, kv_num_heads, block_size, head_dim]
-  // v_cache: [num_blocks, kv_num_heads, block_size, head_dim]
-  // block_table: [batch_size, max_num_blocks_per_seq]
-  // seq_lens: [batch_size]
-  // qkv: [num_tokens, (num_heads+2*num_kv_heads)*head_dim]
-  // out: [num_tokens, hidden_size]
 
   const auto& qkv_dims = qkv.dims();
   PADDLE_ENFORCE_EQ(qkv_dims.size(),
@@ -87,20 +59,6 @@ std::vector<paddle::Tensor> PrefillFusedPagedAttn(
                         "paged_attn receive query dims is "
                         "[num_tokens, (num_heads+2*num_kv_heads)*head_dim]"));
 
-  const auto& kv_cache_dims = k_cache.dims();
-  PADDLE_ENFORCE_EQ(kv_cache_dims.size(),
-                    4,
-                    common::errors::InvalidArgument(
-                        "paged_attn receive kv cache dims is "
-                        "[num_blocks, kv_num_heads, block_size, head_dim]"));
-
-  const auto& block_table_dims = block_table.dims();
-  PADDLE_ENFORCE_EQ(
-      block_table_dims.size(),
-      2,
-      common::errors::InvalidArgument("paged_attn receive block_table dims is "
-                                      "[batch_size, max_num_blocks_per_seq]"));
-
   const auto& cu_seqlens_qkv_dims = cu_seqlens_qkv.dims();
   PADDLE_ENFORCE_EQ(
       cu_seqlens_qkv_dims.size(),
@@ -108,41 +66,22 @@ std::vector<paddle::Tensor> PrefillFusedPagedAttn(
       common::errors::InvalidArgument(
           "paged_attn receive cu_seqlens_qkv dims is [batch_size]"));
 
-  int batch_size = block_table_dims[0];
+  int batch_size = cu_seqlens_qkv_dims[0] - 1;
   int num_tokens = qkv_dims[0];
   int num_total_heads = num_heads + 2 * num_kv_heads;
   int qkv_stride = qkv.strides()[0];
-  int num_blocks = kv_cache_dims[0];
-
-  PADDLE_ENFORCE_EQ(kv_cache_dims[1],
-                    num_kv_heads,
-                    common::errors::InvalidArgument(
-                        "kv_cache_dims[1] must be equal to num_kv_head"));
-  PADDLE_ENFORCE_EQ(kv_cache_dims[2],
-                    block_size,
-                    common::errors::InvalidArgument(
-                        "kv_cache_dims[2] must be equal to block_size"));
-  PADDLE_ENFORCE_EQ(kv_cache_dims[3],
-                    head_dim,
-                    common::errors::InvalidArgument(
-                        "kv_cache_dims[3] must be equal to head_dim"));
-  PADDLE_ENFORCE_EQ(
-      cu_seqlens_qkv_dims[0],
-      batch_size + 1,
-      common::errors::InvalidArgument(
-          "cu_seqlens_qkv_dims[0] must be equal to batch_size + 1"));
 
   auto out = paddle::empty({num_tokens, num_heads * head_dim}, dtype, qkv.place());
 
-  int block_table_stride = block_table.strides()[0];
   const float* rope_sin_ptr = rope_sin.data<float>();
   const float* rope_cos_ptr = rope_cos.data<float>();
   const auto& rope_dims = rope_sin.dims();
   std::vector<int> rope_shape_vec, rope_stride_vec;
   int rope_ndim;
+  int batch_size_or_num_tokens = rope_dims[0];
   if (rope_dims.size() == 4) {
     // [batch_size, max_seq_len, 1, head_dim]
-    PADDLE_ENFORCE_EQ(rope_dims[0],
+    PADDLE_ENFORCE_EQ(batch_size_or_num_tokens,
                       batch_size,
                       common::errors::InvalidArgument(
                           "rope_dims[0] must be equal to batch_size"));
@@ -150,10 +89,22 @@ std::vector<paddle::Tensor> PrefillFusedPagedAttn(
     rope_stride_vec = std::vector<int>({max_seq_len * head_dim, head_dim, 1});
     rope_ndim = 3;
   } else if (rope_dims.size() == 3) {
-    // [max_seq_len, 1, head_dim]
-    rope_shape_vec = std::vector<int>({max_seq_len, head_dim});
-    rope_stride_vec = std::vector<int>({head_dim, 1});
-    rope_ndim = 2;
+    if (batch_size_or_num_tokens == max_seq_len) {
+      // [max_seq_len, 1, head_dim]
+      rope_shape_vec = std::vector<int>({max_seq_len, head_dim});
+      rope_stride_vec = std::vector<int>({head_dim, 1});
+      rope_ndim = 2;
+    } else if (batch_size_or_num_tokens == num_tokens) {
+      // [num_tokens, 1, head_dim]
+      // NOTE: The reason for passing in the max_seq_len parameter is to allow
+      // cuinfer to obtain the max_seq_len value; in actual operation, it still
+      // follows the method of rope_ndim=2.
+      rope_shape_vec = std::vector<int>({num_tokens, max_seq_len, head_dim});
+      rope_stride_vec = std::vector<int>({max_seq_len * head_dim, head_dim, 1});
+      rope_ndim = 3;
+    } else {
+      PD_THROW("Unsupported");
+    }
   } else {
     PD_THROW("Unsupported rope_ndim = %d for Paged attn", rope_ndim);
   }
@@ -198,12 +149,6 @@ std::vector<paddle::Tensor> PrefillFusedPagedAttn(
 
   cuinferTensorDescriptor_t block_table_desc;
   CUINFER_CHECK(cuinferCreateTensorDescriptor(&block_table_desc));
-  CUINFER_CHECK(cuinferSetTensorNdDescriptor(
-      block_table_desc,
-      CUINFER_DATA_INT32,
-      2,
-      std::vector<int>({batch_size, block_table_stride}).data(),
-      std::vector<int>({block_table_stride, 1}).data()));
 
   cuinferTensorDescriptor_t o_desc;
   CUINFER_CHECK(cuinferCreateTensorDescriptor(&o_desc));
@@ -216,29 +161,8 @@ std::vector<paddle::Tensor> PrefillFusedPagedAttn(
 
   cuinferTensorDescriptor_t k_cache_desc;
   CUINFER_CHECK(cuinferCreateTensorDescriptor(&k_cache_desc));
-  CUINFER_CHECK(cuinferSetTensorNdDescriptor(
-      k_cache_desc,
-      data_type,
-      4,
-      std::vector<int>({num_blocks, num_kv_heads, block_size, head_dim}).data(),
-      std::vector<int>({num_kv_heads * block_size * head_dim,
-                        block_size * head_dim,
-                        head_dim,
-                        1})
-          .data()));
-
   cuinferTensorDescriptor_t v_cache_desc;
   CUINFER_CHECK(cuinferCreateTensorDescriptor(&v_cache_desc));
-  CUINFER_CHECK(cuinferSetTensorNdDescriptor(
-      v_cache_desc,
-      data_type,
-      4,
-      std::vector<int>({num_blocks, num_kv_heads, block_size, head_dim}).data(),
-      std::vector<int>({num_kv_heads * block_size * head_dim,
-                        block_size * head_dim,
-                        head_dim,
-                        1})
-          .data()));
 
   cuinferTensorDescriptor_t cos_desc;
   CUINFER_CHECK(cuinferCreateTensorDescriptor(&cos_desc));
@@ -264,13 +188,13 @@ std::vector<paddle::Tensor> PrefillFusedPagedAttn(
                                                  qkv_seqlens_desc,
                                                  cu_seqlens_qkv.data<int32_t>(),
                                                  block_table_desc,
-                                                 block_table.data<int32_t>(),
+                                                 nullptr,
                                                  o_desc,
                                                  out.data(),
                                                  k_cache_desc,
-                                                 k_cache.data(),
+                                                 nullptr,
                                                  v_cache_desc,
-                                                 v_cache.data(),
+                                                 nullptr,
                                                  workspace_ptr,
                                                  workspace_size,
                                                  cos_desc,
@@ -300,7 +224,7 @@ std::vector<paddle::Tensor> PrefillFusedPagedAttn(
   return {out};
 }
 
-std::vector<std::vector<int64_t>> PrefillFusedPagedAttnInferShape(
+std::vector<std::vector<int64_t>> PrefillFusedPagedAttnNoUpdateCacheInferShape(
     const std::vector<int64_t>& qkv_shape,
     const std::vector<int64_t>& k_cache_shape,
     const std::vector<int64_t>& v_cache_shape,
@@ -311,7 +235,6 @@ std::vector<std::vector<int64_t>> PrefillFusedPagedAttnInferShape(
     int num_heads,
     int head_dim,
     int num_kv_heads,
-    int block_size,
     int max_seq_len,
     float scale,
     bool causal,
@@ -321,16 +244,13 @@ std::vector<std::vector<int64_t>> PrefillFusedPagedAttnInferShape(
   return {{qkv_shape[0], num_heads * head_dim}};
 }
 
-std::vector<paddle::DataType> PrefillFusedPagedAttnInferDtype(
+std::vector<paddle::DataType> PrefillFusedPagedAttnNoUpdateCacheInferDtype(
     const paddle::DataType& qkv_dtype) {
   return {qkv_dtype};
 }
 
-PD_BUILD_STATIC_OP(prefill_fused_paged_attn)
+PD_BUILD_STATIC_OP(prefill_fused_paged_attn_without_update_cache)
     .Inputs({"qkv",
-             "k_cache",
-             "v_cache",
-             "block_table",
              "cu_seqlens_qkv",
              "rope_sin",
              "rope_cos"})
@@ -338,7 +258,6 @@ PD_BUILD_STATIC_OP(prefill_fused_paged_attn)
     .Attrs({"num_heads:int",
             "head_dim:int",
             "num_kv_heads:int",
-            "block_size:int",
             "max_seq_len:int",
             "scale:float",
             "causal:bool",
@@ -346,6 +265,6 @@ PD_BUILD_STATIC_OP(prefill_fused_paged_attn)
             "k_rope:bool",
             "v_rope:bool",
             "is_interleaved_rope_mode:bool"})
-    .SetKernelFn(PD_KERNEL(PrefillFusedPagedAttn))
-    .SetInferShapeFn(PD_INFER_SHAPE(PrefillFusedPagedAttnInferShape))
-    .SetInferDtypeFn(PD_INFER_DTYPE(PrefillFusedPagedAttnInferDtype));
+    .SetKernelFn(PD_KERNEL(PrefillFusedPagedAttnNoUpdateCache))
+    .SetInferShapeFn(PD_INFER_SHAPE(PrefillFusedPagedAttnNoUpdateCacheInferShape))
+    .SetInferDtypeFn(PD_INFER_DTYPE(PrefillFusedPagedAttnNoUpdateCacheInferDtype));

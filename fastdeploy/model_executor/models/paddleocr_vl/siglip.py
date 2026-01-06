@@ -64,7 +64,8 @@ class SiglipAttention(nn.Layer):
             self.flash_attn_kwargs = {}
         else:
             # from paddle.nn.functional.flash_attention import flash_attn_unpadded
-            from fastdeploy.model_executor.ops.iluvatar import flash_attn_unpadded
+            # from fastdeploy.model_executor.ops.iluvatar import flash_attn_unpadded
+            from fastdeploy.model_executor.ops.iluvatar import prefill_fused_paged_attention as flash_attn_unpadded
 
             self.flash_attn_func = flash_attn_unpadded
             self.flash_attn_kwargs = {"scale": self.scale, "training": False}
@@ -126,21 +127,42 @@ class SiglipAttention(nn.Layer):
     ):
         B, seq_length, D = hidden_states.shape
         qkv = self.qkv_proj(hidden_states)
-        q, k, v = neox_rope_embedding(qkv, cos_emb, sin_emb, self.num_heads, self.head_dim)
-        attn_output = self.flash_attn_func(
-            q,
-            k,
-            v,
-            cu_seqlens,
-            cu_seqlens,
-            max_seqlen,
-            max_seqlen,
-            causal=False,
-            **self.flash_attn_kwargs,
-        )
-        #)[0]
+        # q, k, v = neox_rope_embedding(qkv, cos_emb, sin_emb, self.num_heads, self.head_dim)
+        # attn_output = self.flash_attn_func(
+        #     q,
+        #     k,
+        #     v,
+        #     cu_seqlens,
+        #     cu_seqlens,
+        #     max_seqlen,
+        #     max_seqlen,
+        #     causal=False,
+        #     **self.flash_attn_kwargs,
+        # )
+        # #)[0]
 
-        attn_output = attn_output.reshape((seq_length, -1))
+        attn_output = self.flash_attn_func(
+            qkv.view([-1, qkv.shape[-1]]),
+            None,
+            None,
+            None,
+            cu_seqlens_qkv=cu_seqlens,
+            rope_sin=sin_emb,
+            rope_cos=cos_emb,
+            num_heads=self.num_heads,
+            head_dim=self.head_dim,
+            num_kv_heads=self.num_heads,
+            block_size=16,
+            max_seq_len=max_seqlen,
+            scale=self.flash_attn_kwargs["scale"],
+            causal=False,
+            q_rope=True,
+            k_rope=True,
+            v_rope=False,
+            is_interleaved_rope_mode=False,
+        )
+
+        # attn_output = attn_output.reshape((seq_length, -1))
         attn_output = self.out_proj(attn_output)
         return attn_output
 

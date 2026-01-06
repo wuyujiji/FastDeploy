@@ -15,17 +15,20 @@
 """
 
 import paddle
+from typing import Optional
 
 try:
     from fastdeploy.model_executor.ops.iluvatar import (
         mixed_fused_paged_attn,
         paged_attn,
         prefill_fused_paged_attn,
+        prefill_fused_paged_attn_without_update_cache,
     )
 except ImportError:
     paged_attn = None
     prefill_fused_paged_attn = None
     mixed_fused_paged_attn = None
+    prefill_fused_paged_attn_without_update_cache = None
 
 
 def paged_attention(
@@ -86,9 +89,9 @@ def paged_attention(
 
 def prefill_fused_paged_attention(
     qkv: paddle.Tensor,
-    k_cache: paddle.Tensor,
-    v_cache: paddle.Tensor,
-    block_tables: paddle.Tensor,
+    k_cache: Optional[paddle.Tensor],
+    v_cache: Optional[paddle.Tensor],
+    block_tables: Optional[paddle.Tensor],
     cu_seqlens_qkv: paddle.Tensor,
     rope_sin: paddle.Tensor,
     rope_cos: paddle.Tensor,
@@ -104,26 +107,44 @@ def prefill_fused_paged_attention(
     v_rope: bool = False,
     is_interleaved_rope_mode: bool = True,
 ):
-    return prefill_fused_paged_attn(
-        qkv,
-        k_cache,
-        v_cache,
-        block_tables,
-        cu_seqlens_qkv,
-        rope_sin,
-        rope_cos,
-        num_heads,
-        head_dim,
-        num_kv_heads,
-        block_size,
-        max_seq_len,
-        scale,
-        causal,
-        q_rope,
-        k_rope,
-        v_rope,
-        is_interleaved_rope_mode,
-    )
+    if k_cache is not None:
+        return prefill_fused_paged_attn(
+            qkv,
+            k_cache,
+            v_cache,
+            block_tables,
+            cu_seqlens_qkv,
+            rope_sin,
+            rope_cos,
+            num_heads,
+            head_dim,
+            num_kv_heads,
+            block_size,
+            max_seq_len,
+            scale,
+            causal,
+            q_rope,
+            k_rope,
+            v_rope,
+            is_interleaved_rope_mode,
+        )
+    else:
+        return prefill_fused_paged_attn_without_update_cache(
+            qkv,
+            cu_seqlens_qkv,
+            rope_sin,
+            rope_cos,
+            num_heads,
+            head_dim,
+            num_kv_heads,
+            max_seq_len,
+            scale,
+            causal,
+            q_rope,
+            k_rope,
+            v_rope,
+            is_interleaved_rope_mode,
+        )
 
 
 def mixed_fused_paged_attention(

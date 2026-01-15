@@ -156,6 +156,8 @@ def main():
         device_count = len(os.getenv("CUDA_VISIBLE_DEVICES", "0,1,2,3,4,5,6,7").split(","))
     elif current_platform.is_xpu():
         device_count = len(os.getenv("XPU_VISIBLE_DEVICES", "0,1,2,3,4,5,6,7").split(","))
+    elif current_platform.is_iluvatar():
+        device_count = len(os.getenv("CUDA_VISIBLE_DEVICES", "0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15").split(","))
 
     processes = start_servers(
         server_count=args.num_servers,

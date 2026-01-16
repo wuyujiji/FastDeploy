@@ -40,6 +40,8 @@ if current_platform.is_xpu():
     from fastdeploy.model_executor.ops.xpu import (
         weight_only_linear_xpu as weight_only_linear,
     )
+elif current_platform.is_iluvatar():
+    from fastdeploy.model_executor.ops.iluvatar import weight_only_linear
 else:
     from paddle.nn.quant import weight_only_linear
 
@@ -319,21 +321,59 @@ class WeightOnlyLinearMethod(QuantMethodBase):
                     quant_type="uint4b8" if self.quant_config.name() == "wint4" else "uint8b128",
                     group_size=self.quant_config.group_size,
                 )
+                weight_dtype = "int32"
             else:
-                quanted_weight_tensor, weight_scale_tensor = weight_quantize(
-                    layer.weight,
-                    algo=self.quant_config.algo,
-                    arch=self.quant_config.weight_only_linear_arch,
-                )
+                if current_platform.is_iluvatar():
+                    if self.quant_config.algo == "weight_only_int8":
+                        quanted_weight_tensor, weight_scale_tensor = weight_quantize(
+                            layer.weight,
+                            algo=self.quant_config.algo,
+                            arch=self.quant_config.weight_only_linear_arch,
+                        )
+                        weight_dtype = "int8"
+                    elif self.quant_config.algo == "weight_only_int4":
+                        from fastdeploy.model_executor.ops.iluvatar.utils import (
+                            get_wint4_quant_func,
+                            wint4_quant_algo
+                        )
+                        if wint4_quant_algo == "wi4a16":
+                            self.quant_config.group_size = 128
+                        else:
+                            # wu4a16_awq or wu4a16_dotsaddz
+                            self.quant_config.group_size = 32
+                        
+                        _quant_func = get_wint4_quant_func()
+                        quanted_weight_tensor, weight_scale_tensor, weight_zeros_tensor = _quant_func(
+                            layer.weight.transpose(0, 1).contiguous(),
+                            group_size=self.quant_config.group_size,
+                        )
+                        layer.weight_zeros = layer.create_parameter(
+                            shape=weight_zeros_tensor.shape,
+                            dtype=weight_zeros_tensor.dtype,
+                            is_bias=False,
+                            default_initializer=paddle.nn.initializer.Constant(0),
+                        )
+                        layer.weight_zeros.copy_(weight_zeros_tensor, False)
+                        weight_dtype = quanted_weight_tensor.dtype
+                    else:
+                        raise NotImplementedError("Iluvarar only support wint8 nand wint4 yet.")
+                        
+                else:
+                    quanted_weight_tensor, weight_scale_tensor = weight_quantize(
+                        layer.weight,
+                        algo=self.quant_config.algo,
+                        arch=self.quant_config.weight_only_linear_arch,
+                    )
+                    weight_dtype = "int8"
 
-                if current_platform.is_maca():
-                    quanted_weight_tensor = paddle.transpose(quanted_weight_tensor, [1, 0])
+                    if current_platform.is_maca():
+                        quanted_weight_tensor = paddle.transpose(quanted_weight_tensor, [1, 0])
 
             free_tensor(layer.weight)
 
             layer.weight = layer.create_parameter(
                 shape=quanted_weight_tensor.shape,
-                dtype="int8" if not isinstance(self, MacheteWeightOnlyLinearMethod) else "int32",
+                dtype=weight_dtype,
                 is_bias=False,
                 default_initializer=paddle.nn.initializer.Constant(0),
             )
@@ -358,14 +398,24 @@ class WeightOnlyLinearMethod(QuantMethodBase):
         raise NotImplementedError
 
     def apply(self, layer, x):
-        linear_out = weight_only_linear(
-            x,
-            weight=layer.weight,
-            bias=layer.bias if layer.with_bias else None,
-            weight_scale=layer.weight_scale,
-            weight_dtype=("int8" if self.quant_config.name() == "wint8" else "int4"),
-            arch=self.quant_config.weight_only_linear_arch,
-        )
+        if current_platform.is_iluvatar():
+            linear_out = weight_only_linear(
+                x,
+                weight=layer.weight,
+                bias=layer.bias if layer.with_bias else None,
+                weight_scale=layer.weight_scale,
+                weight_zeros=layer.weight_zeros if hasattr(layer, "weight_zeros") else None,
+                group_size = self.quant_config.group_size,
+            )                   
+        else:
+            linear_out = weight_only_linear(
+                x,
+                weight=layer.weight,
+                bias=layer.bias if layer.with_bias else None,
+                weight_scale=layer.weight_scale,
+                weight_dtype=("int8" if self.quant_config.name() == "wint8" else "int4"),
+                arch=self.quant_config.weight_only_linear_arch,
+            )
         return linear_out
 
 

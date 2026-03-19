@@ -15,7 +15,7 @@
 #include "helper.h"
 #include "iluvatar_context.h"
 
-std::vector<paddle::Tensor> W8A16GroupGemv(const paddle::Tensor& x,
+std::vector<paddle::Tensor> W4A16GroupGemm(const paddle::Tensor& x,
                                            const paddle::Tensor& weight,
                                            const paddle::Tensor& weight_scale,
                                            const paddle::Tensor& weight_zeros,
@@ -24,43 +24,57 @@ std::vector<paddle::Tensor> W8A16GroupGemv(const paddle::Tensor& x,
   auto dev_ctx = static_cast<const phi::CustomContext*>(
       paddle::experimental::DeviceContextPool::Instance().Get(x.place()));
   auto stream = static_cast<const cudaStream_t>(dev_ctx->stream());
+  auto tokens_per_expert_cpu = tokens_per_expert.copy_to(paddle::CPUPlace(), false);
+
   const auto& x_dims = x.dims();
   const auto& w_dims = weight.dims();
   const auto& ws_dims = weight_scale.dims();
   const auto& tokens_per_expert_dims = tokens_per_expert.dims();
+  const auto& zeros_dims = weight_zeros.dims();
   // [m, k]
   PD_CHECK(x_dims.size() == 2, "x should be 2D");
-  // [n_experts, n, k]
+  // [n_experts, k, n // 8]
   PD_CHECK(w_dims.size() == 3, "weight should be 3D");
-  // [n_experts, n]
-  PD_CHECK(ws_dims.size() == 2, "weight_scale should be 2D");
+  // [n_experts, k // group_size, n]
+  PD_CHECK(ws_dims.size() == 3, "weight_scale should be 3D");
+  // [n_experts, k // group_size, n // 8]
+  PD_CHECK(zeros_dims.size() == 3, "weight_zeros should be 3D");
   // [n_experts]
   PD_CHECK(tokens_per_expert_dims.size() == 1, "tokens_per_expert should be 1D");
-  PD_CHECK(group_size == -1);
+//   PD_CHECK(group_size == -1);
   auto m = x_dims[0];
   auto k = x_dims[1];
   auto n_experts = w_dims[0];
-  auto n = w_dims[1];
-  PD_CHECK(w_dims[2] == k);
+  auto n = w_dims[2] * 8;
+  PD_CHECK(w_dims[1] == k);
   PD_CHECK(ws_dims[0] == n_experts);
-  PD_CHECK(ws_dims[1] == n);
+  PD_CHECK(ws_dims[1] == k / group_size);
+  PD_CHECK(ws_dims[2] == n);
+  PD_CHECK(zeros_dims[0] == n_experts);
+  PD_CHECK(zeros_dims[1] == k / group_size);
+  PD_CHECK(zeros_dims[2] == n / 8);
   PD_CHECK(tokens_per_expert_dims[0] == n_experts);
 
-  PD_CHECK(tokens_per_expert.dtype() == paddle::DataType::INT32);
   PD_CHECK(x.dtype() == paddle::DataType::BFLOAT16 ||
            x.dtype() == paddle::DataType::FLOAT16);
-  PD_CHECK(weight.dtype() == paddle::DataType::INT8);
+  PD_CHECK(weight.dtype() == paddle::DataType::INT32);
   PD_CHECK(weight_scale.dtype() == x.dtype());
+  PD_CHECK(weight_zeros.dtype() == paddle::DataType::INT32);
+  PD_CHECK(tokens_per_expert.dtype() == paddle::DataType::INT32);
+
   PD_CHECK(x.is_contiguous());
   PD_CHECK(weight.is_contiguous());
   PD_CHECK(weight_scale.is_contiguous());
+  PD_CHECK(weight_zeros.is_contiguous());
+  PD_CHECK(tokens_per_expert.is_contiguous());
 
   auto output = GetEmptyTensor({m, n}, x.dtype(), x.place());
+
   cuinferHandle_t handle = iluvatar::getContextInstance()->getIxInferHandle();
   cuinferPointerMode_t cuinfer_ptr_mode = CUINFER_POINTER_MODE_HOST;
-  cuinferOperation_t transa = CUINFER_OP_T;
+  cuinferOperation_t transa = CUINFER_OP_N;
   cuinferOperation_t transb = CUINFER_OP_N;
-  cudaDataType_t Atype = CUDA_R_8I;
+  cudaDataType_t Atype = CUDA_R_4U;
   cudaDataType_t Btype;
   if (x.dtype() == paddle::DataType::FLOAT16) {
     Btype = CUDA_R_16F;
@@ -79,18 +93,19 @@ std::vector<paddle::Tensor> W8A16GroupGemv(const paddle::Tensor& x,
   cust_host_param.size = sizeof(cuinferQuantGEMMHostParam);
   cust_host_param.persistent = 0;
   cust_host_param.groupSize = group_size;
-  // cust_host_param.strideScaleA = n;
+  cust_host_param.strideScaleA = n;
   cust_host_param.expertCount = n_experts;
   cust_host_param.type = 2;
+  cust_host_param.nSize = tokens_per_expert_cpu.data<int32_t>();
 
   cuinferQuantGEMMDeviceParam cust_device_param;
   cust_device_param.size = sizeof(cuinferQuantGEMMDeviceParam);
   cust_device_param.sortedId = nullptr;
   cust_device_param.bias = nullptr;
   cust_device_param.scale = weight_scale.data();
-  cust_device_param.nSize = tokens_per_expert.data<int32_t>();
+  cust_device_param.zero = weight_zeros.data();
 
-  int lda = k;
+  int lda = n;
   int ldb = k;
   int ldc = n;
   float beta = 0.f;
@@ -98,20 +113,24 @@ std::vector<paddle::Tensor> W8A16GroupGemv(const paddle::Tensor& x,
   int batch_count = 1;
 
   size_t workspace_size = 0;
-  CUINFER_CHECK(cuinferGetCustomGemmExWorkspaceWithParam(n,
-                                                         m,
-                                                         k,
-                                                         transa,
-                                                         transb,
-                                                         batch_count,
-                                                         Atype,
-                                                         Btype,
-                                                         Ctype,
-                                                         computeType,
-                                                         scaleType,
-                                                         &cust_host_param,
-                                                         customOption,
-                                                         &workspace_size));
+  CUINFER_CHECK(cuinferGetCustomGemmWorkspace(transa,
+                                              transb,
+                                              n,
+                                              m,
+                                              k,
+                                              Atype,
+                                              lda,
+                                              0,
+                                              Btype,
+                                              ldb,
+                                              0,
+                                              Ctype,
+                                              ldc,
+                                              0,
+                                              batch_count,
+                                              computeType,
+                                              scaleType,
+                                              &workspace_size));
   if (workspace_size > 0) {
     auto* allocator = paddle::GetAllocator(x.place());
     phi::Allocator::AllocationPtr tmp_workspace;
@@ -121,54 +140,53 @@ std::vector<paddle::Tensor> W8A16GroupGemv(const paddle::Tensor& x,
     cust_device_param.workspace = nullptr;
   }
 
-  CUINFER_CHECK(cuinferCustomGemmEx(handle,
-                                    stream,
-                                    cuinfer_ptr_mode,
-                                    transa,
-                                    transb,
-                                    n,
-                                    m,
-                                    k,
-                                    &alpha,
-                                    weight.data(),
-                                    Atype,
-                                    lda,
-                                    0,
-                                    x.data(),
-                                    Btype,
-                                    ldb,
-                                    0,
-                                    &beta,
-                                    output.data(),
-                                    Ctype,
-                                    ldc,
-                                    0,
-                                    batch_count,
-                                    computeType,
-                                    scaleType,
-                                    &cust_host_param,
-                                    &cust_device_param,
-                                    customOption,
-                                    cust_device_param.workspace));
+  CUINFER_CHECK(cuinferCustomGemm(handle,
+                                  stream,
+                                  cuinfer_ptr_mode,
+                                  transa,
+                                  transb,
+                                  n,
+                                  m,
+                                  k,
+                                  &alpha,
+                                  weight.data(),
+                                  Atype,
+                                  lda,
+                                  n * k,
+                                  x.data(),
+                                  Btype,
+                                  ldb,
+                                  0,
+                                  &beta,
+                                  output.data(),
+                                  Ctype,
+                                  ldc,
+                                  0,
+                                  batch_count,
+                                  computeType,
+                                  scaleType,
+                                  &cust_host_param,
+                                  &cust_device_param,
+                                  customOption));
   return {output};
 }
 
-std::vector<std::vector<int64_t>> W8A16GroupGemvInferShape(
+std::vector<std::vector<int64_t>> W4A16GroupGemmInferShape(
     const std::vector<int64_t>& x_shape,
     const std::vector<int64_t>& weight_shape) {
   return {{x_shape[0], weight_shape[1]}};
 }
-std::vector<paddle::DataType> W8A16GroupGemvInferDtype(
-    const paddle::DataType& input_dtype) {
+
+std::vector<paddle::DataType> W4A16GroupGemmInferDtype(const paddle::DataType& input_dtype) {
   return {input_dtype};
 }
 
-PD_BUILD_STATIC_OP(w8a16_group_gemv)
+PD_BUILD_STATIC_OP(w4a16_group_gemm)
     .Inputs({"x", "weight", "weight_scale", "weight_zeros", "tokens_per_expert"})
     .Outputs({"output"})
     .Attrs({
         "group_size:int",
     })
-    .SetKernelFn(PD_KERNEL(W8A16GroupGemv))
-    .SetInferShapeFn(PD_INFER_SHAPE(W8A16GroupGemvInferShape))
-    .SetInferDtypeFn(PD_INFER_DTYPE(W8A16GroupGemvInferDtype));
+    .SetKernelFn(PD_KERNEL(W4A16GroupGemm))
+    .SetInferShapeFn(PD_INFER_SHAPE(W4A16GroupGemmInferShape))
+    .SetInferDtypeFn(PD_INFER_DTYPE(W4A16GroupGemmInferDtype));

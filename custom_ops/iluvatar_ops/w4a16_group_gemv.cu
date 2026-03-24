@@ -32,11 +32,11 @@ std::vector<paddle::Tensor> W4A16GroupGemv(const paddle::Tensor& x,
   const auto& zeros_dims = weight_zeros.dims();
   // [m, k]
   PD_CHECK(x_dims.size() == 2, "x should be 2D");
-  // [n_experts, k, n // 8]
+  // [n_experts, n // 2, k]
   PD_CHECK(w_dims.size() == 3, "weight should be 3D");
   // [n_experts, k // group_size, n]
   PD_CHECK(ws_dims.size() == 3, "weight_scale should be 3D");
-  // [n_experts, k // group_size, n // 8]
+  // [n_experts, k // group_size, n]
   PD_CHECK(zeros_dims.size() == 3, "weight_zeros should be 3D");
   // [n_experts]
   PD_CHECK(tokens_per_expert_dims.size() == 1, "tokens_per_expert should be 1D");
@@ -44,19 +44,19 @@ std::vector<paddle::Tensor> W4A16GroupGemv(const paddle::Tensor& x,
   auto m = x_dims[0];
   auto k = x_dims[1];
   auto n_experts = w_dims[0];
-  auto n = w_dims[2] * 8;
-  PD_CHECK(w_dims[1] == k);
+  auto n = w_dims[1] * 2;
+  PD_CHECK(w_dims[2] == k);
   PD_CHECK(ws_dims[0] == n_experts);
   PD_CHECK(ws_dims[1] == k / group_size);
   PD_CHECK(ws_dims[2] == n);
   PD_CHECK(zeros_dims[0] == n_experts);
   PD_CHECK(zeros_dims[1] == k / group_size);
-  PD_CHECK(zeros_dims[2] == n / 8);
+  PD_CHECK(zeros_dims[2] == n);
   PD_CHECK(tokens_per_expert_dims[0] == n_experts);
 
   PD_CHECK(x.dtype() == paddle::DataType::BFLOAT16 ||
            x.dtype() == paddle::DataType::FLOAT16);
-  PD_CHECK(weight.dtype() == paddle::DataType::INT32);
+  PD_CHECK(weight.dtype() == paddle::DataType::INT8);
   PD_CHECK(weight_scale.dtype() == x.dtype());
   PD_CHECK(weight_zeros.dtype() == paddle::DataType::INT32);
   PD_CHECK(tokens_per_expert.dtype() == paddle::DataType::INT32);
@@ -71,9 +71,9 @@ std::vector<paddle::Tensor> W4A16GroupGemv(const paddle::Tensor& x,
 
   cuinferHandle_t handle = iluvatar::getContextInstance()->getIxInferHandle();
   cuinferPointerMode_t cuinfer_ptr_mode = CUINFER_POINTER_MODE_HOST;
-  cuinferOperation_t transa = CUINFER_OP_N;
+  cuinferOperation_t transa = CUINFER_OP_T;
   cuinferOperation_t transb = CUINFER_OP_N;
-  cudaDataType_t Atype = CUDA_R_4U;
+  cudaDataType_t Atype = CUDA_R_4I;
   cudaDataType_t Btype;
   if (x.dtype() == paddle::DataType::FLOAT16) {
     Btype = CUDA_R_16F;
@@ -104,7 +104,7 @@ std::vector<paddle::Tensor> W4A16GroupGemv(const paddle::Tensor& x,
   cust_device_param.zero = weight_zeros.data();
   cust_device_param.nSize = tokens_per_expert.data<int32_t>();
 
-  int lda = n;
+  int lda = k;
   int ldb = k;
   int ldc = n;
   float beta = 0.f;

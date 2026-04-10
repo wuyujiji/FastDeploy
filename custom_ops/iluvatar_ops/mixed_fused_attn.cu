@@ -291,7 +291,8 @@ void MixedFusedPagedAttnKernel(
                                          0,
                                          0,
                                          nullptr,
-                                         static_cast<size_t>(rope_batch_stride),
+                                         nullptr,
+                                         static_cast<unsigned>(rope_batch_stride),
                                          rope_mode};
 
   CUINFER_CHECK(cuInferPageAttentionV7(cuinfer_handle,

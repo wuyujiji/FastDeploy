@@ -10,7 +10,7 @@ tqdm
 pynvml
 uvicorn>=0.38.0
 fastapi
-paddleformers==1.0.0
+# paddleformers==1.0.0
 redis
 etcd3
 httpx
@@ -22,7 +22,7 @@ xlwt
 visualdl
 setuptools-scm>=8
 prometheus-client
-decord
+decord2
 moviepy
 wheel
 triton
@@ -42,5 +42,5 @@ partial_json_parser
 msgspec
 safetensors>=0.7.0
 py-cpuinfo
-transformers>=4.55.1,<5.0.0
+transformers==5.3.0
 paddleocr[doc-parser]==3.3.2

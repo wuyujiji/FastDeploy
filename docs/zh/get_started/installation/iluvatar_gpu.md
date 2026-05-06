@@ -16,14 +16,14 @@ modinfo iluvatar |grep description
 Pull the Docker image
 
 ```bash
-docker pull ccr-2vdh3abv-pub.cnc.bj.baidubce.com/device/paddle-ixuca:3.3.0-20260312
+docker pull ccr-2vdh3abv-pub.cnc.bj.baidubce.com/device/paddle-ixuca:3.3.0-20260507
 ```
 
 ## 3. 准备容器
 ### 3.1 启动容器
 
 ```bash
-docker run -itd --name paddle_infer --network host -v /usr/src:/usr/src -v /lib/modules:/lib/modules -v /dev:/dev -v /home/paddle:/home/paddle -v /usr/local/corex/bin/ixsmi:/usr/local/corex/bin/ixsmi -v /usr/local/corex/lib64/libcuda.so.1:/usr/local/corex/lib64/libcuda.so.1 -v /usr/local/corex/lib64/libixml.so:/usr/local/corex/lib64/libixml.so -v /usr/local/corex/lib64/libixthunk.so:/usr/local/corex/lib64/libixthunk.so --privileged --cap-add=ALL --pid=host ccr-2vdh3abv-pub.cnc.bj.baidubce.com/device/paddle-ixuca:3.3.0-20260312
+docker run -itd --name paddle_infer --network host -v /usr/src:/usr/src -v /lib/modules:/lib/modules -v /dev:/dev -v /home/paddle:/home/paddle -v /usr/local/corex/bin/ixsmi:/usr/local/corex/bin/ixsmi -v /usr/local/corex/lib64/libcuda.so.1:/usr/local/corex/lib64/libcuda.so.1 -v /usr/local/corex/lib64/libixml.so:/usr/local/corex/lib64/libixml.so -v /usr/local/corex/lib64/libixthunk.so:/usr/local/corex/lib64/libixthunk.so --privileged --cap-add=ALL --pid=host ccr-2vdh3abv-pub.cnc.bj.baidubce.com/device/paddle-ixuca:3.3.0-20260507
 docker exec -it paddle_infer bash
 ```
 

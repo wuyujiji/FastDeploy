@@ -484,8 +484,16 @@ def get_host_ip():
     """
     Get host IP address
     """
-    ip = socket.gethostbyname(socket.gethostname())
-    return ip
+    try:
+        return socket.gethostbyname(socket.gethostname())
+    except socket.gaierror:
+        # Hostname resolution may fail in some containers without /etc/hosts entry.
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                s.connect(("8.8.8.8", 80))
+                return s.getsockname()[0]
+        except OSError:
+            return "127.0.0.1"
 
 
 def get_random_port():

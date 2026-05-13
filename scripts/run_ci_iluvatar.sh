@@ -322,7 +322,7 @@ python -m fastdeploy.entrypoints.openai.api_server \
        --max-num-seqs 64 \
        --workers 2 \
        --block-size 16 \
-       --graph-optimization-config '{"use_cudagraph": true}' > server.log 2>&1 &
+       --graph-optimization-config '{"graph_opt_level":2, "use_cudagraph": true}' > server.log 2>&1 &
 
 check_server_status
 

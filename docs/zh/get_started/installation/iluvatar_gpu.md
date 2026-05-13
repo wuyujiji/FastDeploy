@@ -23,13 +23,13 @@ docker pull ccr-2vdh3abv-pub.cnc.bj.baidubce.com/device/paddle-ixuca:3.3.0-20260
 ### 3.1 启动容器
 
 ```bash
-docker run -itd --name paddle_infer --network host -v /usr/src:/usr/src -v /lib/modules:/lib/modules -v /dev:/dev -v /home/paddle:/home/paddle -v /usr/local/corex/bin/ixsmi:/usr/local/corex/bin/ixsmi -v /usr/local/corex/lib64/libcuda.so.1:/usr/local/corex/lib64/libcuda.so.1 -v /usr/local/corex/lib64/libixml.so:/usr/local/corex/lib64/libixml.so -v /usr/local/corex/lib64/libixthunk.so:/usr/local/corex/lib64/libixthunk.so --privileged --cap-add=ALL --pid=host ccr-2vdh3abv-pub.cnc.bj.baidubce.com/device/paddle-ixuca:3.3.0-20260507
-docker exec -it paddle_infer bash
+docker run -itd --name fd_iluvatar -v /usr/src:/usr/src -v /lib/modules:/lib/modules -v /dev:/dev -v /home/workspace:/home/workspace -v /usr/local/corex/bin/ixsmi:/usr/local/corex/bin/ixsmi -v /usr/local/corex/lib64/libcuda.so.1:/usr/local/corex/lib64/libcuda.so.1 -v /usr/local/corex/lib64/libixml.so:/usr/local/corex/lib64/libixml.so -v /usr/local/corex/lib64/libixthunk.so:/usr/local/corex/lib64/libixthunk.so --privileged --shm-size=64G --net=host --cap-add=ALL --pid=host ccr-2vdh3abv-pub.cnc.bj.baidubce.com/device/paddle-ixuca:3.3.0-20260507
+docker exec -it fd_iluvatar bash
 ```
 
 注意: 由于镜像中的 4.3.8 SDK 与 KMD 不兼容，paddle 无法找到 iluvatar device。因此，暂时需要将宿主机 corex-4.3.8 目录中的 ixsmi、libcuda.so.1、libixml.so 和 libixthunk.so 映射到容器中
 
-/home/paddle 为模型文件、whl包、脚本所在目录。
+/home/workspace 为模型文件、whl包、脚本所在目录。
 
 ### 3.2 安装paddle
 
@@ -478,17 +478,17 @@ export LD_PRELOAD=/usr/local/corex/lib64/libcuda.so.1
 export FD_SAMPLING_CLASS=rejection
 export CUDA_VISIBLE_DEVICES=1
 python3 -m fastdeploy.entrypoints.openai.api_server \
-       --model /data1/fastdeploy/PaddleOCR-VL \
-       --port 8180 \
-       --metrics-port 8471 \
-       --engine-worker-queue-port 8472 \
-       --cache-queue-port 55660 \
-       --max-model-len 16384 \
-       --max-num-batched-tokens 16384 \
-       --max-num-seqs 64 \
-       --workers 2 \
-       --block-size 16 \
-       --graph-optimization-config '{"use_cudagraph": true}'
+        --model /data1/fastdeploy/PaddleOCR-VL \
+        --port 8180 \
+        --metrics-port 8471 \
+        --max-model-len 16384 \
+        --max-num-batched-tokens 16384 \
+        --max-num-seqs 240 \
+        --block-size 16 \
+        --workers 2 \
+        --gpu-memory-utilization 0.7 \
+        --graph-optimization-config '{"graph_opt_level":2, "use_cudagraph": true}'
+
 ```
 
 客户端:

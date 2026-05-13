@@ -23,13 +23,13 @@ docker pull ccr-2vdh3abv-pub.cnc.bj.baidubce.com/device/paddle-ixuca:3.3.0-20260
 ### 3.1 Start Container
 
 ```bash
-docker run -itd --name paddle_infer --network host -v /usr/src:/usr/src -v /lib/modules:/lib/modules -v /dev:/dev -v /home/paddle:/home/paddle -v /usr/local/corex/bin/ixsmi:/usr/local/corex/bin/ixsmi -v /usr/local/corex/lib64/libcuda.so.1:/usr/local/corex/lib64/libcuda.so.1 -v /usr/local/corex/lib64/libixml.so:/usr/local/corex/lib64/libixml.so -v /usr/local/corex/lib64/libixthunk.so:/usr/local/corex/lib64/libixthunk.so --privileged --cap-add=ALL --pid=host ccr-2vdh3abv-pub.cnc.bj.baidubce.com/device/paddle-ixuca:3.3.0-20260507
-docker exec -it paddle_infer bash
+docker run -itd --name fd_iluvatar -v /usr/src:/usr/src -v /lib/modules:/lib/modules -v /dev:/dev -v /home/workspace:/home/workspace -v /usr/local/corex/bin/ixsmi:/usr/local/corex/bin/ixsmi -v /usr/local/corex/lib64/libcuda.so.1:/usr/local/corex/lib64/libcuda.so.1 -v /usr/local/corex/lib64/libixml.so:/usr/local/corex/lib64/libixml.so -v /usr/local/corex/lib64/libixthunk.so:/usr/local/corex/lib64/libixthunk.so --privileged --shm-size=64G --net=host --cap-add=ALL --pid=host ccr-2vdh3abv-pub.cnc.bj.baidubce.com/device/paddle-ixuca:3.3.0-20260507
+docker exec -it fd_iluvatar bash
 ```
 
 Note: Because the 4.3.8 SDK in the image is incompatible with KMD, paddle cannot find the iluvatar device. Therefore, it is temporarily necessary to map ixsmi, libcuda.so.1, libixml.so, and libixthunk.so from the host corex-4.3.8 directory into the container.
 
-/home/paddle contains the model files, *.whl packages, and scripts.
+/home/workspace contains the model files, *.whl packages, and scripts.
 
 ### 3.2 Install paddle
 
@@ -478,17 +478,17 @@ export LD_PRELOAD=/usr/local/corex/lib64/libcuda.so.1
 export FD_SAMPLING_CLASS=rejection
 export CUDA_VISIBLE_DEVICES=1
 python3 -m fastdeploy.entrypoints.openai.api_server \
-       --model /data1/fastdeploy/PaddleOCR-VL \
-       --port 8180 \
-       --metrics-port 8471 \
-       --engine-worker-queue-port 8472 \
-       --cache-queue-port 55660 \
-       --max-model-len 16384 \
-       --max-num-batched-tokens 16384 \
-       --max-num-seqs 64 \
-       --workers 2 \
-       --block-size 16 \
-       --graph-optimization-config '{"use_cudagraph": true}'
+        --model /data1/fastdeploy/PaddleOCR-VL \
+        --port 8180 \
+        --metrics-port 8471 \
+        --max-model-len 16384 \
+        --max-num-batched-tokens 16384 \
+        --max-num-seqs 240 \
+        --block-size 16 \
+        --workers 2 \
+        --gpu-memory-utilization 0.7 \
+        --graph-optimization-config '{"graph_opt_level":2, "use_cudagraph": true}'
+
 ```
 
 client:

@@ -247,7 +247,25 @@ class SiglipVisionEmbeddings(nn.Layer):
             batch_size, squence_len, channel, height, width = pixel_values.shape
             target_dtype = self.patch_embedding.weight.dtype
             pixel_values = rearrange(pixel_values, "b l c h w -> (b l) c h w")
-            patch_embeds = self.patch_embedding(pixel_values.to(dtype=target_dtype))  # shape = [*, width, grid, grid]
+            pixel_values = pixel_values.to(dtype=target_dtype)
+            if current_platform.is_iluvatar():
+                from fastdeploy.model_executor.ops.iluvatar import conv2d
+
+                bias = self.patch_embedding.bias
+                if bias is not None and bias.dtype != paddle.float32:
+                    bias = bias.astype(paddle.float32)
+                patch_embeds = conv2d(
+                    pixel_values,
+                    self.patch_embedding.weight,
+                    bias,
+                    stride=self.patch_size,
+                    padding=0,
+                    dilation=1,
+                    groups=1,
+                    channel_last=False,
+                )
+            else:
+                patch_embeds = self.patch_embedding(pixel_values)  # shape = [*, width, grid, grid]
             embeddings = patch_embeds.flatten(-2).squeeze(-1)
             embeddings = rearrange(embeddings, "(b l) d -> b l d", b=batch_size, l=squence_len)
             # todo: not debug
